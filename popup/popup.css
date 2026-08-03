@@ -1,0 +1,967 @@
+:root {
+  /* Material Design 3 (M3) Dark Theme Color Tokens */
+  --m3-bg: #141218;
+  --m3-surface: #1d1b20;
+  --m3-surface-container-low: #1d1b20;
+  --m3-surface-container: #211f26;
+  --m3-surface-container-high: #2b2930;
+  --m3-surface-container-highest: #36343b;
+
+  --m3-primary: #d0bcff; /* M3 Lavender */
+  --m3-on-primary: #381e72;
+  --m3-primary-container: #4f378b;
+  --m3-on-primary-container: #eaddff;
+
+  --m3-secondary: #ccc2dc;
+  --m3-on-secondary: #332d41;
+  --m3-secondary-container: #4a4458;
+
+  --m3-tertiary: #efb8c8;
+  --m3-success: #81c784;
+  --m3-error: #f2b8b5;
+
+  --m3-on-surface: #e6e1e5;
+  --m3-on-surface-variant: #cac4d0;
+  --m3-outline: #49454f;
+  --m3-outline-variant: rgba(255, 255, 255, 0.12);
+
+  --m3-font: Roboto, Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 410px;
+  max-height: 620px;
+  margin: 0;
+  overflow-y: auto;
+  color: var(--m3-on-surface);
+  background: var(--m3-bg);
+  font-family: var(--m3-font);
+  user-select: none;
+}
+
+/* Scrollbar */
+body::-webkit-scrollbar {
+  width: 5px;
+}
+body::-webkit-scrollbar-track {
+  background: var(--m3-bg);
+}
+body::-webkit-scrollbar-thumb {
+  background: var(--m3-surface-container-highest);
+  border-radius: 4px;
+}
+
+main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  overflow: hidden;
+}
+
+/* Activity Log Sliding Drawer Sheet (With Door Handle Tab Attached to Top Border) */
+.m3-activity-log-sheet {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 220px;
+  background: var(--m3-surface-container-highest);
+  border-top: 1px solid var(--m3-primary);
+  border-radius: 20px 20px 0 0;
+  padding: 16px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: none;
+  z-index: 100;
+  transform: translateY(100%);
+  transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.35s ease;
+}
+
+.m3-activity-log-sheet.open {
+  transform: translateY(0);
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.75);
+}
+
+/* Physical Door Handle Tab attached protruding at top border of sheet */
+.m3-door-handle {
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 20px;
+  border-radius: 9999px;
+  border: 1px solid var(--m3-primary);
+  background: var(--m3-surface-container-highest);
+  color: var(--m3-primary);
+  cursor: pointer;
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1),
+              background-color 0.2s ease,
+              border-color 0.2s ease,
+              box-shadow 0.2s ease;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+  z-index: 120;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+.m3-door-handle:hover {
+  background: var(--m3-primary);
+  color: var(--m3-on-primary);
+  border-color: var(--m3-primary);
+  box-shadow: 0 4px 16px rgba(208, 188, 255, 0.4);
+  transform: translateX(-50%) scale(1.08);
+}
+
+.m3-door-handle:active {
+  transform: translateX(-50%) scale(0.95);
+}
+
+.triangle-icon {
+  transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  transform: rotate(0deg);
+}
+
+.m3-activity-log-sheet.open .triangle-icon,
+.triangle-icon.open {
+  transform: rotate(180deg);
+}
+
+.m3-log-box {
+  flex: 1;
+  min-height: 220px;
+  max-height: 260px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #141218;
+  border: 1px solid var(--m3-outline);
+  font-family: "SF Mono", Consolas, Monaco, monospace;
+  font-size: 9.5px;
+  color: var(--m3-on-surface-variant);
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+}
+
+.log-entry {
+  line-height: 1.5;
+  font-size: 9.5px;
+  margin-bottom: 2px;
+  word-break: break-word;
+}
+
+.log-date-divider {
+  position: sticky;
+  top: -10px;
+  z-index: 1;
+  margin: 8px -2px 5px;
+  padding: 3px 5px;
+  border-bottom: 1px solid var(--m3-outline);
+  background: #141218;
+  color: var(--m3-primary);
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.log-date-divider:first-child {
+  margin-top: -2px;
+}
+
+.log-entry.log-red {
+  color: #f2b8b5;
+}
+
+.log-entry.log-yellow {
+  color: #ffd54f;
+}
+
+.log-entry.log-green {
+  color: #81c784;
+}
+
+.log-entry.log-cyan {
+  color: #d0bcff;
+}
+
+.m3-log-box::-webkit-scrollbar {
+  width: 4px;
+}
+
+.m3-log-box::-webkit-scrollbar-thumb {
+  background: var(--m3-outline);
+  border-radius: 2px;
+}
+
+.m3-log-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.m3-library-close-btn {
+  border: 1px solid var(--m3-outline);
+  background: var(--m3-surface-container-high);
+  color: var(--m3-primary);
+  cursor: pointer;
+}
+
+.m3-claimed-library-preview {
+  cursor: pointer;
+}
+
+.m3-claimed-library-preview:focus-visible {
+  outline: 2px solid var(--m3-primary);
+  outline-offset: 2px;
+}
+
+.m3-library-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 14px;
+  background: var(--m3-bg);
+  overflow: hidden;
+}
+
+.m3-library-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.m3-library-modal-header h2 {
+  margin: 0;
+  color: var(--m3-on-surface);
+  font-size: 15px;
+}
+
+.m3-library-modal-header p {
+  margin: 3px 0 0;
+  color: var(--m3-on-surface-variant);
+  font-size: 10px;
+}
+
+.m3-library-close-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.claimed-library-all-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.m3-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-clear-btn {
+  border: 1px solid var(--m3-outline);
+  background: var(--m3-surface-container);
+  color: var(--m3-on-surface-variant);
+}
+
+.m3-clear-btn:hover {
+  background: var(--m3-surface-container-high);
+  color: var(--m3-on-surface);
+  border-color: var(--m3-primary);
+  transform: translateY(-1px);
+}
+
+.m3-clear-btn:active {
+  transform: translateY(0) scale(0.95);
+}
+
+.m3-kill-btn {
+  border: 1px solid var(--m3-error);
+  background: rgba(242, 184, 181, 0.12);
+  color: var(--m3-error);
+}
+
+.m3-kill-btn:hover:not(:disabled) {
+  background: var(--m3-error);
+  color: #381e72;
+  box-shadow: 0 3px 10px rgba(242, 184, 181, 0.35);
+  transform: translateY(-1px);
+}
+
+.m3-kill-btn:active {
+  transform: translateY(0) scale(0.95);
+}
+
+.m3-kill-btn:disabled {
+  border-color: var(--m3-outline);
+  background: var(--m3-surface-container-high);
+  color: var(--m3-on-surface-variant);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Status Footer Bar */
+.m3-status-footer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 4px 2px;
+  margin-top: 4px;
+}
+
+.m3-status-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.m3-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--m3-primary);
+  flex-shrink: 0;
+}
+
+.status-text {
+  margin: 0;
+  font-size: 9.5px;
+  color: var(--m3-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* M3 App Header */
+.m3-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 4px 10px;
+}
+
+.m3-brand-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.m3-app-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1), filter 0.2s ease;
+}
+
+.m3-app-logo:hover {
+  transform: scale(1.1);
+  filter: drop-shadow(0 0 8px rgba(208, 188, 255, 0.45));
+}
+
+.m3-brand-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.m3-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.m3-app-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--m3-on-surface);
+  letter-spacing: -0.01em;
+}
+
+.m3-v2-badge {
+  padding: 1px 7px;
+  border-radius: 9999px;
+  background: var(--m3-primary-container);
+  color: var(--m3-primary);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.app-subtitle {
+  margin: 2px 0 0;
+  font-size: 10px;
+  color: var(--m3-on-surface-variant);
+}
+
+.m3-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--m3-outline-variant);
+  background: var(--m3-surface-container-high);
+  color: var(--m3-primary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.m3-icon-btn:hover {
+  background: var(--m3-primary);
+  color: var(--m3-on-primary);
+  transform: scale(1.06);
+  box-shadow: 0 2px 10px rgba(208, 188, 255, 0.3);
+}
+
+/* View Panels */
+.m3-view-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* M3 Card & Box State Layer Hover Animations */
+.m3-account-card,
+.m3-card-section,
+.m3-setup-card,
+.m3-game-card,
+.m3-claimed-card {
+  position: relative;
+  transition: transform 0.22s cubic-bezier(0.2, 0, 0, 1),
+              border-color 0.22s cubic-bezier(0.2, 0, 0, 1),
+              box-shadow 0.22s cubic-bezier(0.2, 0, 0, 1),
+              background-color 0.22s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-account-card:hover,
+.m3-card-section:hover,
+.m3-setup-card:hover,
+.m3-game-card:hover,
+.m3-claimed-card:hover {
+  transform: translateY(-2px);
+  background-image: linear-gradient(rgba(208, 188, 255, 0.08), rgba(208, 188, 255, 0.08));
+  border-color: rgba(208, 188, 255, 0.45);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45), 0 0 14px rgba(208, 188, 255, 0.12);
+}
+
+/* Connected Account Card */
+.m3-account-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: var(--m3-surface-container);
+  border: 1px solid var(--m3-outline-variant);
+}
+
+.m3-account-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.m3-shield-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--m3-primary-container);
+  color: var(--m3-primary);
+  flex-shrink: 0;
+}
+
+.m3-account-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.m3-account-status {
+  font-size: 11px;
+  color: var(--m3-on-surface-variant);
+}
+
+.m3-account-status strong {
+  font-weight: 700;
+}
+
+.status-connected {
+  color: var(--m3-primary);
+}
+
+.status-disconnected {
+  color: var(--m3-tertiary);
+}
+
+.m3-account-email {
+  font-size: 9.5px;
+  color: var(--m3-on-surface-variant);
+  font-weight: 500;
+  opacity: 0.9;
+  letter-spacing: 0.01em;
+  margin-top: 1px;
+}
+
+.m3-account-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* M3 Pill Buttons & Interactive States */
+.m3-pill-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  border: 1px solid var(--m3-primary);
+  background: rgba(208, 188, 255, 0.08);
+  color: var(--m3-primary);
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.18s cubic-bezier(0.2, 0, 0, 1),
+              box-shadow 0.18s cubic-bezier(0.2, 0, 0, 1),
+              background-color 0.18s cubic-bezier(0.2, 0, 0, 1),
+              color 0.18s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-pill-btn:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.03);
+  background: var(--m3-primary);
+  color: var(--m3-on-primary);
+  box-shadow: 0 4px 14px rgba(208, 188, 255, 0.35);
+}
+
+.m3-pill-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.96);
+  box-shadow: 0 2px 6px rgba(208, 188, 255, 0.2);
+}
+
+.m3-pill-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Red Logout Button */
+.m3-pill-btn-danger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 11px;
+  border-radius: 9999px;
+  border: 1px solid var(--m3-error);
+  background: rgba(242, 184, 181, 0.12);
+  color: var(--m3-error);
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.18s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-pill-btn-danger:hover {
+  background: var(--m3-error);
+  color: #381e72;
+  box-shadow: 0 3px 10px rgba(242, 184, 181, 0.35);
+  transform: translateY(-1px);
+}
+
+.m3-pill-btn-danger:active {
+  transform: translateY(0) scale(0.96);
+}
+
+/* Setup Card */
+.m3-setup-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(239, 184, 200, 0.1);
+  border: 1px solid rgba(239, 184, 200, 0.3);
+}
+
+.m3-setup-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setup-emoji {
+  font-size: 16px;
+}
+
+.m3-setup-left strong {
+  display: block;
+  font-size: 11px;
+  color: var(--m3-tertiary);
+}
+
+.m3-setup-left p {
+  margin: 1px 0 0;
+  font-size: 9px;
+  color: var(--m3-on-surface-variant);
+}
+
+.m3-pill-btn-primary {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 9999px;
+  background: var(--m3-tertiary);
+  color: #381e72;
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* M3 Container Cards */
+.m3-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 18px;
+  background: var(--m3-surface-container);
+  border: 1px solid var(--m3-outline-variant);
+}
+
+.m3-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.m3-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.m3-card-title h2 {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--m3-on-surface);
+}
+
+.m3-count-badge {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: var(--m3-surface-container-high);
+  color: var(--m3-on-surface-variant);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+/* Automation Switches M3 */
+.m3-setting-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.m3-setting-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.setting-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.setting-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m3-on-surface);
+}
+
+.setting-desc {
+  font-size: 9.5px;
+  color: var(--m3-on-surface-variant);
+}
+
+/* M3 Switch Component */
+.m3-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.m3-switch input {
+  display: none;
+}
+
+.switch-track {
+  position: relative;
+  width: 40px;
+  height: 20px;
+  border-radius: 9999px;
+  background: var(--m3-surface-container-highest);
+  border: 1px solid var(--m3-outline);
+  transition: all 0.2s ease;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--m3-on-surface-variant);
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.m3-switch input:checked + .switch-track {
+  background: var(--m3-primary);
+  border-color: var(--m3-primary);
+}
+
+.m3-switch input:checked + .switch-track .switch-thumb {
+  transform: translateX(20px);
+  background: var(--m3-on-primary);
+}
+
+.m3-select {
+  padding: 4px 10px;
+  border: 1px solid var(--m3-outline);
+  border-radius: 8px;
+  background: var(--m3-surface-container-high);
+  color: var(--m3-on-surface);
+  font-size: 10px;
+  outline: none;
+  cursor: pointer;
+}
+
+/* Game Lists & M3 Cards */
+.game-list, .claimed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.m3-game-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--m3-surface-container-high);
+  transition: background 0.2s ease;
+}
+
+.m3-game-card:hover {
+  background: var(--m3-surface-container-highest);
+}
+
+.m3-game-link-card {
+  cursor: pointer;
+}
+
+.m3-game-link-card:focus-visible {
+  outline: 2px solid var(--m3-primary);
+  outline-offset: 2px;
+}
+
+.m3-cover-wrapper {
+  position: relative;
+  width: 64px;
+  height: 40px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  flex-shrink: 0;
+}
+
+.cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.m3-free-badge {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--m3-primary);
+  color: var(--m3-on-primary);
+  font-size: 7.5px;
+  font-weight: 800;
+}
+
+.m3-game-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--m3-on-surface);
+}
+
+.expiry {
+  font-size: 9.5px;
+  color: var(--m3-on-surface-variant);
+}
+
+.claim-btn {
+  padding: 5px 14px;
+  border-radius: 9999px;
+  border: none;
+  background: var(--m3-primary);
+  color: var(--m3-on-primary);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+
+.claim-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+  box-shadow: 0 2px 8px rgba(208, 188, 255, 0.3);
+}
+
+.claim-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  background: var(--m3-surface-container-highest);
+  color: var(--m3-on-surface-variant);
+}
+
+/* Claimed Cards (With Cover Banner) */
+.m3-claimed-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--m3-surface-container-high);
+}
+
+.m3-claimed-card.is-recent-preview {
+  border: 1px solid rgba(208, 188, 255, 0.5);
+  background: linear-gradient(90deg, rgba(208, 188, 255, 0.14), rgba(129, 199, 132, 0.08));
+  box-shadow: inset 3px 0 0 var(--m3-primary);
+}
+
+.claimed-cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.m3-claimed-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.claimed-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m3-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claimed-date {
+  font-size: 9px;
+  color: var(--m3-on-surface-variant);
+}
+
+.m3-badge-claimed {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: rgba(129, 199, 132, 0.15);
+  color: var(--m3-success);
+  font-size: 8.5px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed var(--m3-outline);
+  border-radius: 10px;
+  color: var(--m3-on-surface-variant);
+  font-size: 10px;
+  text-align: center;
+}
+
+.refresh-svg {
+  transition: transform 0.3s ease;
+}
+
+.refreshing .refresh-svg {
+  animation: md-spin 1s linear infinite;
+}
+
+@keyframes md-spin {
+  100% { transform: rotate(360deg); }
+}

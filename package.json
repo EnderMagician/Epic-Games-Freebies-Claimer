@@ -1,0 +1,9 @@
+{
+  "name": "epic-freebies-claimer",
+  "private": true,
+  "version": "3.0.0",
+  "scripts": {
+    "test": "node --test tests/core.test.js",
+    "check": "node --check scripts/background.js && node --check scripts/content-epic.js && node --check scripts/core/auth-model.js && node --check scripts/core/auth-client.js && node --check scripts/core/state-model.js && node --check scripts/core/claim-machine.js && node --check scripts/core/claim-routing.js && node --check scripts/core/claim-queue.js && node --check scripts/core/epic-observation.js && node --check popup/popup.js && node --check tests/live-brave.mjs"
+  }
+}
