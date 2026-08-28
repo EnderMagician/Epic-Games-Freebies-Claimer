@@ -141,6 +141,31 @@ test('completes when Get directly transitions to owned', () => {
   assert.equal(completed.task.phase, 'completed');
 });
 
+test('does not click Get until the page verifies a zero-cost offer', () => {
+  const task = createClaimTask({ gameId: 'epic-safe-get', tabId: 4 });
+  const result = reduceClaimTask(task, {
+    ownershipVisible: false,
+    visibleActions: ['get'],
+    freeEvidence: 'unknown',
+    blockers: []
+  }, 5);
+
+  assert.equal(result.decision.action, 'wait');
+  assert.equal(result.task.phase, 'waiting_for_get');
+});
+
+test('records progress timestamps for recovery timeouts', () => {
+  const task = createClaimTask({ gameId: 'epic-progress', tabId: 5, now: 10 });
+  const result = reduceClaimTask(task, {
+    ownershipVisible: false,
+    visibleActions: ['get'],
+    freeEvidence: 'confirmed',
+    blockers: []
+  }, 20);
+
+  assert.equal(result.task.lastProgressAt, 20);
+});
+
 test('clicks only a verified-free confirmation action', () => {
   const task = { ...createClaimTask({ gameId: 'epic-confirm', tabId: 2 }), phase: 'awaiting_outcome' };
   const result = reduceClaimTask(task, {

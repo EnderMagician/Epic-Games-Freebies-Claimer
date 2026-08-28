@@ -17,9 +17,11 @@ const CLAIM_QUEUE_KEY = "claimQueue";
 const STORAGE_VERSION_KEY = "storageSchemaVersion";
 const MIGRATION_BACKUP_KEY = "migrationBackupV2";
 const ALARM_NAME = "freebies-daily-check";
+const CLAIM_WATCHDOG_ALARM = "freebies-claim-watchdog";
 const AUTH_CACHE_TTL_MS = 15000;
 const AUTH_CHANGE_DEBOUNCE_MS = 750;
 const NOTIFICATION_COVER_TIMEOUT_MS = 2000;
+const CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
 
 let isClaimRunning = false;
 let sessionLogs = [];
@@ -29,6 +31,7 @@ let authRefreshTimer = null;
 let authRefreshInFlight = false;
 let authRefreshQueued = false;
 let claimQueuePumpPromise = null;
+let claimStateMutation = Promise.resolve();
 const completionNotificationIds = new Set();
 
 function taskStorage() {
@@ -64,6 +67,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   await ensureSettings();
   await addLog("Extension installed / reloaded.");
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1440 });
+  chrome.alarms.create(CLAIM_WATCHDOG_ALARM, { periodInMinutes: 1 });
   await refreshCatalog({ force: true });
 });
 
@@ -71,11 +75,15 @@ chrome.runtime.onStartup.addListener(async () => {
   await ensureSettings();
   await addLog("Browser startup detected.");
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1440 });
-  await runDailyCheck();
+  chrome.alarms.create(CLAIM_WATCHDOG_ALARM, { periodInMinutes: 1 });
+  await reconcileClaimState();
+  if ((await getSettings()).runOnStartup) await runDailyCheck();
+  else await addLog("Startup check skipped: Run on browser startup is disabled.");
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) await runDailyCheck();
+  if (alarm.name === CLAIM_WATCHDOG_ALARM) await reconcileClaimState();
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -166,13 +174,14 @@ async function handleMessage(message, sender) {
     case "check-login-status":
       return checkEpicLoginStatus({ force: true });
     case "claim-item":
-      if ((await getClaimQueue())?.status === "running") throw new Error("A serial claim queue is already running.");
+      if ((await getClaimQueue())?.status === "running" || (await getActiveTasks()).length > 0) throw new Error("A claim is already running.");
       await queueClaim(message.platform, message.id, false);
       return {};
     case "claim-ready":
+      if (sender.frameId !== 0) return { task: null };
       return { task: sender?.tab?.id ? await getOrAdoptClaimTask(sender.tab.id, message.url || sender.tab.url || "", message.allowAdoption !== false) : null };
     case "claim-observation": {
-      if (!sender?.tab?.id) return { task: null, decision: { action: "wait", reason: "No tab context." } };
+      if (!sender?.tab?.id || sender.frameId !== 0) return { task: null, decision: { action: "wait", reason: "No top-frame tab context." } };
       const task = await getActiveTask(sender.tab.id);
       if (!task) return { task: null, decision: { action: "wait", reason: "No active claim task for this tab." } };
       const reduced = reduceClaimTask({ ...task, frameId: sender.frameId ?? task.frameId }, message.observation || {}, Date.now());
@@ -420,6 +429,7 @@ async function checkEpicLoginStatus({ force = false } = {}) {
 }
 
 async function getState() {
+  await reconcileClaimState();
   const results = await Promise.allSettled([
     getSettings(),
     chrome.storage.local.get(CATALOG_KEY),
@@ -453,7 +463,7 @@ async function getState() {
   return {
     ...snapshot,
     claimQueue,
-    isClaimRunning: isClaimRunning || claimQueue?.status === "running",
+    isClaimRunning: isClaimRunning || claimQueue?.status === "running" || activeTasks.length > 0,
     accountEmail: authCheck.accountEmail || authCheck.accountLabel || null
   };
 }
@@ -478,6 +488,12 @@ async function getActiveTasks() {
   const stored = await taskStorage().get(TASKS_KEY).catch(() => ({}));
   const tasks = stored[TASKS_KEY] && typeof stored[TASKS_KEY] === "object" ? stored[TASKS_KEY] : {};
   return Object.values(tasks);
+}
+
+function mutateClaimState(operation) {
+  const mutation = claimStateMutation.then(operation, operation);
+  claimStateMutation = mutation.catch(() => {});
+  return mutation;
 }
 
 async function getActiveTask(tabId) {
@@ -508,17 +524,22 @@ async function getOrAdoptClaimTask(tabId, pageUrl, allowAdoption = true) {
 }
 
 async function saveActiveTask(task) {
-  const stored = await taskStorage().get(TASKS_KEY).catch(() => ({}));
-  const tasks = stored[TASKS_KEY] && typeof stored[TASKS_KEY] === "object" ? stored[TASKS_KEY] : {};
-  tasks[String(task.tabId)] = task;
-  await taskStorage().set({ [TASKS_KEY]: tasks });
+  return mutateClaimState(async () => {
+    const stored = await taskStorage().get(TASKS_KEY).catch(() => ({}));
+    const tasks = stored[TASKS_KEY] && typeof stored[TASKS_KEY] === "object" ? stored[TASKS_KEY] : {};
+    tasks[String(task.tabId)] = task;
+    await taskStorage().set({ [TASKS_KEY]: tasks });
+    return task;
+  });
 }
 
 async function removeActiveTask(tabId) {
-  const stored = await taskStorage().get(TASKS_KEY).catch(() => ({}));
-  const tasks = stored[TASKS_KEY] && typeof stored[TASKS_KEY] === "object" ? { ...stored[TASKS_KEY] } : {};
-  delete tasks[String(tabId)];
-  await taskStorage().set({ [TASKS_KEY]: tasks }).catch(() => {});
+  return mutateClaimState(async () => {
+    const stored = await taskStorage().get(TASKS_KEY).catch(() => ({}));
+    const tasks = stored[TASKS_KEY] && typeof stored[TASKS_KEY] === "object" ? { ...stored[TASKS_KEY] } : {};
+    delete tasks[String(tabId)];
+    await taskStorage().set({ [TASKS_KEY]: tasks }).catch(() => {});
+  });
 }
 
 async function getClaimQueue() {
@@ -527,8 +548,57 @@ async function getClaimQueue() {
 }
 
 async function saveClaimQueue(queue) {
-  await taskStorage().set({ [CLAIM_QUEUE_KEY]: queue }).catch(() => {});
-  return queue;
+  return mutateClaimState(async () => {
+    await taskStorage().set({ [CLAIM_QUEUE_KEY]: queue }).catch(() => {});
+    return queue;
+  });
+}
+
+async function reconcileClaimState() {
+  const queue = await getClaimQueue();
+  if (!queue || queue.status !== "running") return queue;
+  if (!queue.current) {
+    await pumpClaimQueue();
+    return getClaimQueue();
+  }
+
+  const current = queue.current;
+  const task = await getActiveTask(current.tabId);
+  const tab = await chrome.tabs.get(current.tabId).catch(() => null);
+  const taskAge = Date.now() - (task?.lastProgressAt || current.startedAt || Date.now());
+  if (tab && task && (task.phase === "needs_attention" || taskAge < CLAIM_TIMEOUT_MS)) return queue;
+
+  if (tab && task) {
+    const detail = "Claim timed out while waiting for Epic to confirm ownership.";
+    const failed = finishCurrentClaim(queue, { tabId: current.tabId, status: "failed", detail, now: Date.now() });
+    await removeActiveTask(current.tabId);
+    spawnedClaimTabIds.delete(current.tabId);
+    await chrome.tabs.remove(current.tabId).catch(() => {});
+    await recordClaimStatus(current.platform || "epic", current.id, "failed", detail);
+    await saveClaimQueue(failed);
+    await addLog(`Timed out claim for "${current.title}" after five minutes.`);
+    if (failed.status === "completed") await finalizeSerialQueue(failed);
+    else await pumpClaimQueue();
+    return failed;
+  }
+
+  if (tab && !task) {
+    const restored = { ...createClaimTask({ gameId: current.id, tabId: current.tabId, now: Date.now() }), platform: current.platform, origin: "queue-recovery" };
+    await saveActiveTask(restored);
+    await chrome.tabs.reload(current.tabId).catch(() => {});
+    await addLog(`Recovered claim observer for "${current.title}" after a worker restart.`);
+    return queue;
+  }
+
+  const detail = "Claim tab was no longer available during queue recovery.";
+  const failed = finishCurrentClaim(queue, { tabId: current.tabId, status: "failed", detail, now: Date.now() });
+  await removeActiveTask(current.tabId);
+  await recordClaimStatus(current.platform || "epic", current.id, "failed", detail);
+  await saveClaimQueue(failed);
+  await addLog(`Recovered stale claim for "${current.title}": ${detail}`);
+  if (failed.status === "completed") await finalizeSerialQueue(failed);
+  else await pumpClaimQueue();
+  return failed;
 }
 
 async function rebindSerialQueueTab(fromTabId, toTabId) {
@@ -591,8 +661,8 @@ async function refreshCatalog({ force = false } = {}) {
     await addLog("Force-refreshing catalog from Epic Games Store...");
   }
 
-  // If not forced and already refreshed today, return cached catalog to prevent redundant network syncs
-  if (!force && previous.refreshedAt && previous.refreshedAt.slice(0, 10) === today) {
+  // Only a successful refresh is eligible for the daily cache.
+  if (!force && !previous.errors?.epic && previous.refreshedAt && previous.refreshedAt.slice(0, 10) === today) {
     await addLog("Catalog is up-to-date for today (cached).");
     return previous;
   }
@@ -600,10 +670,12 @@ async function refreshCatalog({ force = false } = {}) {
   const country = settings.country || "VN";
   const [epicResult] = await Promise.allSettled([fetchEpicGames(country)]);
 
+  const refreshedAt = epicResult.status === "fulfilled" ? new Date().toISOString() : previous.refreshedAt || null;
   const epicGames = epicResult.status === "fulfilled" ? epicResult.value : previous.epic || [];
   const catalog = {
     epic: epicGames,
-    refreshedAt: new Date().toISOString(),
+    refreshedAt,
+    lastAttemptAt: new Date().toISOString(),
     errors: {
       ...(epicResult.status === "rejected" ? { epic: readableError(epicResult.reason) } : {})
     }
@@ -688,6 +760,10 @@ async function runDailyCheck() {
     await addLog("Daily check skipped: Account not logged in.");
     return;
   }
+  if (!settings.runOnStartup) {
+    await addLog("Daily check skipped: Scheduled checks are disabled.");
+    return;
+  }
   if (!settings.autoClaim) {
     await addLog("Daily check skipped: Auto-claim switch is disabled.");
     return;
@@ -698,8 +774,12 @@ async function runDailyCheck() {
   }
 
   await addLog("Daily startup check triggered.");
-  await updateSettingsInternal({ lastDailyRun: today });
-  await runClaimBatch({ force: false });
+  try {
+    await runClaimBatch({ force: false });
+    await updateSettingsInternal({ lastDailyRun: today });
+  } catch (error) {
+    await addLog(`Daily check failed and will retry later: ${readableError(error)}`);
+  }
 }
 
 async function runClaimNow() {
@@ -722,8 +802,14 @@ async function runClaimBatch({ force = false }) {
     await pumpClaimQueue();
     return { total: existingQueue.pending.length + (existingQueue.current ? 1 : 0), queued: existingQueue.pending.length, skipped: 0, failed: 0, message };
   }
-
+  const activeTasks = await getActiveTasks();
+  if (activeTasks.length > 0) {
+    const message = "A claim task is already active.";
+    await addLog(message);
+    return { total: activeTasks.length, queued: 0, skipped: 0, failed: 0, message };
+  }
   const catalog = await refreshCatalog({ force });
+  if (catalog.errors?.epic) throw new Error(`Catalog refresh failed: ${catalog.errors.epic}`);
   const games = [...catalog.epic];
   const claimed = await getEpicClaimedGames();
   const completedIds = new Set(claimed.filter(isClaimCompleted).map((game) => game.id));
@@ -891,6 +977,8 @@ async function recordClaimStatus(platform, id, status, detail = "") {
 }
 
 async function showClaimSuccessNotification(game) {
+  const settings = await getSettings();
+  if (!settings.notifyOnClaim) return;
   const queue = await getClaimQueue();
   let contextMessage = "Added to your Epic Games library";
   if (queue?.current?.id === game.id) {

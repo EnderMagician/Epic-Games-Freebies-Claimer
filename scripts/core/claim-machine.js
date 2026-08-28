@@ -14,6 +14,7 @@
       attempts: 0,
       startedAt: now,
       updatedAt: now,
+      lastProgressAt: now,
       lastObservation: null,
       terminalReason: null
     };
@@ -30,6 +31,7 @@
     if (observation.ownershipVisible) {
       current.phase = 'completed';
       current.terminalReason = 'owned';
+      current.lastProgressAt = now;
       return { task: current, decision: decision('complete_owned', 'Epic shows the game is owned or in the library.') };
     }
 
@@ -42,15 +44,17 @@
     if (blockers.length > 0) {
       current.phase = 'needs_attention';
       current.terminalReason = blockers.join(', ');
+      current.lastProgressAt = now;
       return { task: current, decision: decision('needs_attention', `Manual attention required: ${current.terminalReason}`) };
     }
 
     const canConfirm = observation.freeEvidence === 'confirmed' && (actions.has('add_to_library') || actions.has('place_order'));
 
-    if ((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') && actions.has('get')) {
+    if ((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') && actions.has('get') && observation.freeEvidence === 'confirmed') {
       current.phase = 'awaiting_outcome';
       current.terminalReason = null;
       current.attempts += 1;
+      current.lastProgressAt = now;
       return { task: current, decision: decision('click_get', 'Visible Get action is available.') };
     }
 

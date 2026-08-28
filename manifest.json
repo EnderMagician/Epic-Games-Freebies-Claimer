@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Epic Games Freebies Claimer",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Auto-detects & claims free games on Epic Games Store.",
   "icons": {
     "16": "icons/icon16.png",
@@ -28,7 +28,6 @@
         "https://www.epicgames.com/*"
       ],
       "js": ["scripts/core/epic-observation.js", "scripts/content-epic.js"],
-      "all_frames": true,
       "run_at": "document_idle"
     }
   ],

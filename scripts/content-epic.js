@@ -5,14 +5,15 @@ let observationInFlight = false;
 let stopped = false;
 let observer = null;
 let intervalId = null;
+let observationTimer = null;
 
 initializeClaimObserver().catch((error) => {
   send({ type: 'claim-result', platform: 'epic', id: activeTask?.gameId, status: 'failed', detail: error.message || String(error) });
 });
 
 async function initializeClaimObserver() {
-  const allowAdoption = window.top === window.self;
-  for (let attempt = 0; attempt < (allowAdoption ? 1 : 2) && !activeTask; attempt += 1) {
+  const allowAdoption = true;
+  for (let attempt = 0; attempt < 1 && !activeTask; attempt += 1) {
     const response = await send({ type: 'claim-ready', url: location.href, allowAdoption });
     if (response?.ok && response.task) activeTask = response.task;
     if (!activeTask) await delay(500);
@@ -20,16 +21,26 @@ async function initializeClaimObserver() {
   if (!activeTask) return;
 
   observer = new MutationObserver(scheduleObservation);
-  observer.observe(document.documentElement || document, { subtree: true, childList: true, characterData: true, attributes: true });
-  intervalId = setInterval(scheduleObservation, 900);
+  observer.observe(document.documentElement || document, { subtree: true, childList: true, characterData: true });
+  intervalId = setInterval(scheduleObservation, 1500);
   window.addEventListener('load', scheduleObservation, { once: false });
   scheduleObservation();
 }
 
 function scheduleObservation() {
+  if (stopped || observationInFlight || observationTimer) return;
+  observationTimer = setTimeout(() => {
+    observationTimer = null;
+    runObservation();
+  }, 250);
+}
+
+function runObservation() {
   if (stopped || observationInFlight) return;
   observationInFlight = true;
-  observePage().finally(() => { observationInFlight = false; });
+  observePage()
+    .catch((error) => send({ type: 'claim-action-result', action: 'observation_error', detail: error.message || String(error) }))
+    .finally(() => { observationInFlight = false; });
 }
 
 async function observePage() {
@@ -55,7 +66,7 @@ async function observePage() {
 
 async function clickAction(action, observation) {
   const element = findActionButton(action);
-  if (!element || observation.freeEvidence === 'nonzero' || (action !== 'get' && observation.freeEvidence !== 'confirmed')) return false;
+  if (!element || observation.freeEvidence !== 'confirmed') return false;
   element.click();
   await send({ type: 'claim-action-result', action, detail: `Clicked ${action}.` });
   return true;
@@ -83,6 +94,7 @@ function stopObserver() {
   stopped = true;
   observer?.disconnect();
   if (intervalId) clearInterval(intervalId);
+  if (observationTimer) clearTimeout(observationTimer);
 }
 
 function delay(ms) {

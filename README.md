@@ -11,6 +11,7 @@ It uses the Epic account session already present in the browser. It does not sto
 - Automates the supported free-game flow:
   `Get` → `Add to Library` / zero-cost checkout → owned confirmation.
 - Claims games serially in inactive tabs: one game page is completed before the next game starts without switching away from the user's current tab.
+- Recovers a persisted serial queue after a service-worker restart, and times out an unresponsive checkout after five minutes instead of leaving the queue stuck.
 - Handles Epic checkout pages that open a child tab and rebinds the active claim automatically.
 - Shows a quiet native notification with the game's cover when ownership is newly confirmed; cover loading is capped at two seconds and never pauses the claim queue.
 - Recognizes a manually opened current giveaway page when Auto-claim is enabled.
@@ -65,6 +66,7 @@ The main popup displays the three newest games recorded as claimed or owned. Cli
 
 - **Auto-claim new freebies** enables automatic claiming during startup/daily checks and manual scans.
 - **Run on browser startup** enables the once-per-day startup check.
+- Disabling **Run on browser startup** also disables scheduled daily checks; Manual Start remains available.
 - **Store Region** controls the Epic catalog country used for giveaway detection.
 
 ### Activity Log
@@ -88,6 +90,13 @@ For a batch claim, the background worker creates a persistent serial queue:
 7. Continue with the next queued game.
 
 If you manually open a URL matching a current unclaimed giveaway, the content script can adopt that tab when Auto-claim is enabled. A manually opened page is not adopted while a different serial queue item is active.
+
+### Reliability safeguards in v3.1.0
+
+- Queue and active-task writes are serialized so simultaneous browser events cannot overwrite each other's state.
+- A one-minute watchdog verifies that the active tab and task still exist. If the worker restarted without a task, it restores the observer; if the tab disappeared, it records the failed item and continues the queue.
+- Normal checkout progress has a five-minute timeout. CAPTCHA, terms, and other `needs attention` states remain paused for manual completion instead of timing out.
+- The page observer runs in the top frame only, debounces DOM changes, and requires confirmed zero-cost evidence before clicking **Get** or checkout confirmation.
 
 ## Troubleshooting
 
@@ -144,7 +153,7 @@ npm test
 npm run check
 ```
 
-The automated tests cover migration, authentication fallback, safe page observation, claim state transitions, serial queue behavior, child-tab rebinding, and manually opened giveaway URLs.
+The automated tests cover migration, authentication fallback, safe page observation, zero-cost action gating, claim state transitions, serial queue behavior, child-tab rebinding, and manually opened giveaway URLs.
 
 ## Intentional limitations
 
