@@ -25,10 +25,12 @@
     {
       "matches": [
         "https://store.epicgames.com/*",
-        "https://www.epicgames.com/*"
+        "https://www.epicgames.com/*",
+        "https://payment-website-pci.ol.epicgames.com/*"
       ],
       "js": ["scripts/core/epic-observation.js", "scripts/content-epic.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "permissions": ["storage", "alarms", "notifications", "tabs", "cookies"],

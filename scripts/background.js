@@ -22,6 +22,7 @@ const AUTH_CACHE_TTL_MS = 15000;
 const AUTH_CHANGE_DEBOUNCE_MS = 750;
 const NOTIFICATION_COVER_TIMEOUT_MS = 2000;
 const CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_CLICK_FAILURES = 3;
 
 let isClaimRunning = false;
 let sessionLogs = [];
@@ -32,6 +33,10 @@ let authRefreshInFlight = false;
 let authRefreshQueued = false;
 let claimQueuePumpPromise = null;
 let claimStateMutation = Promise.resolve();
+let sessionLogMutation = Promise.resolve();
+const claimTaskMutations = new Map();
+const claimLogKeys = new Map();
+const claimUniqueLogKeys = new Set();
 const completionNotificationIds = new Set();
 
 function taskStorage() {
@@ -51,11 +56,44 @@ async function getSessionLogs() {
 }
 
 async function addLog(msg) {
-  await getSessionLogs();
-  const entry = `[${formatLogTimestamp()}] ${msg}`;
-  sessionLogs.unshift(entry);
-  if (sessionLogs.length > 80) sessionLogs.pop();
-  await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
+  const write = sessionLogMutation.then(async () => {
+    await getSessionLogs();
+    const entry = `[${formatLogTimestamp()}] ${msg}`;
+    sessionLogs.unshift(entry);
+    if (sessionLogs.length > 80) sessionLogs.pop();
+    await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
+  }, async () => {
+    await getSessionLogs();
+    const entry = `[${formatLogTimestamp()}] ${msg}`;
+    sessionLogs.unshift(entry);
+    if (sessionLogs.length > 80) sessionLogs.pop();
+    await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
+  });
+  sessionLogMutation = write.catch(() => {});
+  return write;
+}
+
+async function addClaimLog(key, msg) {
+  const now = Date.now();
+  const previous = claimLogKeys.get(key) || 0;
+  if (now - previous < 10_000) return;
+  if (claimLogKeys.size >= 500) claimLogKeys.delete(claimLogKeys.keys().next().value);
+  claimLogKeys.set(key, now);
+  for (const [savedKey, savedAt] of claimLogKeys) {
+    if (now - savedAt > 60_000) claimLogKeys.delete(savedKey);
+  }
+  await addLog(msg);
+}
+
+async function addUniqueClaimLog(key, msg) {
+  if (claimUniqueLogKeys.has(key)) return;
+  if (claimUniqueLogKeys.size >= 500) claimUniqueLogKeys.delete(claimUniqueLogKeys.values().next().value);
+  claimUniqueLogKeys.add(key);
+  await addLog(msg);
+}
+
+function safeLogDetail(value, maxLength = 180) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
 function formatLogTimestamp(date = new Date()) {
@@ -103,7 +141,17 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   const task = await getActiveTask(tab.openerTabId);
   if (!task) return;
   await removeActiveTask(tab.openerTabId);
-  const rebound = { ...task, tabId: tab.id, frameId: 0, updatedAt: Date.now() };
+  // Epic can put a second Get action in its checkout child tab. Treat the child
+  // as a fresh page while retaining the claim identity and queue ownership.
+  const rebound = {
+    ...task,
+    tabId: tab.id,
+    frameId: 0,
+    phase: "waiting_for_get",
+    terminalReason: null,
+    updatedAt: Date.now(),
+    lastProgressAt: Date.now()
+  };
   await saveActiveTask(rebound);
   await rebindSerialQueueTab(tab.openerTabId, tab.id);
   spawnedClaimTabIds.delete(tab.openerTabId);
@@ -147,6 +195,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+function serializeClaimTask(tabId, operation) {
+  const key = String(tabId);
+  const previous = claimTaskMutations.get(key) || Promise.resolve();
+  const next = previous.then(operation, operation);
+  const tracked = next.catch(() => {});
+  claimTaskMutations.set(key, tracked);
+  return next.finally(() => {
+    if (claimTaskMutations.get(key) === tracked) claimTaskMutations.delete(key);
+  });
+}
+
+function isTrustedEpicHost(hostname, { checkout = false } = {}) {
+  const host = String(hostname || '').toLowerCase();
+  if (host === 'store.epicgames.com' || host === 'www.epicgames.com') return true;
+  return checkout && host === 'payment-website-pci.ol.epicgames.com';
+}
+
+function isTrustedClaimFrame(sender, message = {}) {
+  const frameId = sender?.frameId || 0;
+  let parsed;
+  if (!sender?.url) return frameId === 0;
+  try { parsed = new URL(sender.url); } catch (error) { return false; }
+  if (parsed.protocol !== "https:") return false;
+  const context = message.frameContext || message.observation?.context || '';
+  if (!isTrustedEpicHost(parsed.hostname, { checkout: frameId !== 0 || context === 'checkout' })) return false;
+  if (frameId === 0) return true;
+  const checkoutPath = /(?:\/purchase|\/checkout|\/payment)/i.test(parsed.pathname + parsed.search);
+  return context === 'checkout' && (checkoutPath || parsed.hostname === 'payment-website-pci.ol.epicgames.com');
+}
+
+async function logClaimAttachment(task, sender, context = 'unknown') {
+  const frameId = sender?.frameId || 0;
+  const key = `attachment:${task.gameId}:${task.tabId}:${frameId}`;
+  await addUniqueClaimLog(key, `Attached claim observer for "${safeLogDetail(task.title || task.gameId, 100)}" (tab #${task.tabId}, frame #${frameId}, ${context}).`);
+}
+
+function claimObservationDiagnosticKey(task, sender, observation, decision) {
+  return [
+    'diagnostic', task.gameId, task.tabId, sender?.frameId || 0,
+    observation.context || 'unknown', observation.offerEvidence || 'unknown',
+    observation.checkoutTotalEvidence || 'unknown',
+    (observation.visibleActions || []).join(','), (observation.blockers || []).join(','),
+    decision.action, decision.reason
+  ].join(':');
+}
+
+async function logClaimObservation(task, sender, observation, decision) {
+  const actions = (observation.visibleActions || []).join(',') || 'none';
+  const blockers = (observation.blockers || []).join(',') || 'none';
+  const context = observation.context || 'unknown';
+  const offer = observation.offerEvidence || 'unknown';
+  const checkout = observation.checkoutTotalEvidence || 'unknown';
+  const detail = `Claim "${safeLogDetail(task.title || task.gameId, 100)}" (tab #${task.tabId}, frame #${sender?.frameId || 0}, ${context}): actions=${actions}; offer=${offer}; checkout_total=${checkout}; blockers=${blockers}; ${decision.action} - ${safeLogDetail(decision.reason)}.`;
+  await addUniqueClaimLog(claimObservationDiagnosticKey(task, sender, observation, decision), detail);
+}
+
 async function handleMessage(message, sender) {
   switch (message.type) {
     case "get-state":
@@ -178,31 +282,145 @@ async function handleMessage(message, sender) {
       await queueClaim(message.platform, message.id, false);
       return {};
     case "claim-ready":
-      if (sender.frameId !== 0) return { task: null };
-      return { task: sender?.tab?.id ? await getOrAdoptClaimTask(sender.tab.id, message.url || sender.tab.url || "", message.allowAdoption !== false) : null };
-    case "claim-observation": {
-      if (!sender?.tab?.id || sender.frameId !== 0) return { task: null, decision: { action: "wait", reason: "No top-frame tab context." } };
-      const task = await getActiveTask(sender.tab.id);
-      if (!task) return { task: null, decision: { action: "wait", reason: "No active claim task for this tab." } };
-      const reduced = reduceClaimTask({ ...task, frameId: sender.frameId ?? task.frameId }, message.observation || {}, Date.now());
-      await saveActiveTask(reduced.task);
-      if (reduced.decision.action === "complete_owned") {
-        await recordClaimStatus(task.platform || "epic", task.gameId, "owned", reduced.decision.reason);
-        await removeActiveTask(sender.tab.id);
-        spawnedClaimTabIds.delete(sender.tab.id);
-        try { await chrome.tabs.remove(sender.tab.id); } catch (e) { /* already closed */ }
-        await finishSerialQueueItem(sender.tab.id, "owned", reduced.decision.reason);
-      } else if (reduced.decision.action === "needs_attention") {
-        if (task.phase !== "needs_attention") {
-          await recordClaimStatus(task.platform || "epic", task.gameId, "needs_attention", reduced.decision.reason);
-          await addLog(`Serial queue paused for ${task.gameId}: ${reduced.decision.reason}`);
-        }
+      if (!sender?.tab?.id) return { task: null };
+      if (sender.frameId !== 0) {
+        const task = await getActiveTask(sender.tab.id);
+        if (!task || !isTrustedClaimFrame(sender, message)) return { task: null };
+        await logClaimAttachment(task, sender, message.frameContext || 'unknown');
+        return { task };
       }
-      return { task: reduced.task, decision: reduced.decision };
+      if (!isTrustedClaimFrame(sender, message)) return { task: null };
+      const task = await getOrAdoptClaimTask(sender.tab.id, sender.url || message.url || sender.tab.url || "", message.allowAdoption !== false);
+      if (task) await logClaimAttachment(task, sender, message.frameContext || 'unknown');
+      return { task };
+    case "claim-observation": {
+      if (!sender?.tab?.id) return { task: null, decision: { action: "wait", reason: "No tab context." } };
+      return serializeClaimTask(sender.tab.id, async () => {
+        const task = await getActiveTask(sender.tab.id);
+        if (!task) return { task: null, decision: { action: "wait", reason: "No active claim task for this tab." } };
+        if (!isTrustedClaimFrame(sender, message)) {
+          const decision = { action: "wait", reason: "Ignoring an untrusted Epic frame." };
+          await addClaimLog(`route:${sender.tab.id}:${sender.frameId || 0}`, `Ignored untrusted claim frame for ${task.gameId}.`);
+          return { task, decision };
+        }
+        const observation = { ...(message.observation || {}) };
+        if (sender.frameId !== 0 && observation.context !== "checkout") {
+          const decision = { action: "wait", reason: "Waiting for a trusted checkout frame." };
+          await logClaimObservation(task, sender, observation, decision);
+          return { task, decision };
+        }
+        if (sender.frameId === 0 && observation.identityMatch === false) {
+          const decision = { action: "wait", reason: "Waiting for the queued product page." };
+          await logClaimObservation(task, sender, observation, decision);
+          return { task, decision };
+        }
+        if (task.clickRetriesExhausted && !observation.ownershipVisible) {
+          const decision = {
+            action: "needs_attention",
+            reason: task.terminalReason || "Manual attention required after repeated failed clicks."
+          };
+          await logClaimObservation(task, sender, observation, decision);
+          return { task, decision };
+        }
+        const reduced = reduceClaimTask({ ...task, frameId: sender.frameId ?? task.frameId }, observation, Date.now());
+        await logClaimObservation(task, sender, observation, reduced.decision);
+        const taskWithAction = ['click_get', 'click_confirm'].includes(reduced.decision.action)
+          ? {
+            ...reduced.task,
+            pendingAction: {
+              kind: reduced.decision.action,
+              frameId: sender.frameId || 0,
+              requestedAt: Date.now()
+            }
+          }
+          : reduced.task;
+        await saveActiveTask(taskWithAction);
+        if (reduced.decision.action === "complete_owned") {
+          await recordClaimStatus(task.platform || "epic", task.gameId, "owned", reduced.decision.reason);
+          await removeActiveTask(sender.tab.id);
+          spawnedClaimTabIds.delete(sender.tab.id);
+          try { await chrome.tabs.remove(sender.tab.id); } catch (e) { /* already closed */ }
+          await finishSerialQueueItem(sender.tab.id, "owned", reduced.decision.reason);
+        } else if (reduced.decision.action === "needs_attention") {
+          if (task.phase !== "needs_attention" || task.terminalReason !== reduced.task.terminalReason) {
+            await recordClaimStatus(task.platform || "epic", task.gameId, "needs_attention", reduced.decision.reason);
+            await addLog(`Serial queue paused for ${task.gameId}: ${reduced.decision.reason}`);
+          }
+        }
+        return { task: taskWithAction, decision: reduced.decision };
+      });
     }
     case "claim-action-result":
-      await addLog(`Claim action ${message.action || "unknown"}: ${message.detail || ""}`);
+      if (sender?.tab?.id) {
+        if (!isTrustedClaimFrame(sender, message)) return {};
+        await serializeClaimTask(sender.tab.id, async () => {
+          const task = await getActiveTask(sender.tab.id);
+          if (!task) return;
+          const action = message.action || "unknown";
+          const success = message.success !== false;
+          const detail = safeLogDetail(message.detail || "");
+          const pending = task.pendingAction;
+          const matchesPending = pending && pending.frameId === (sender.frameId || 0)
+            && ((pending.kind === "click_get" && action === "get")
+              || (pending.kind === "click_confirm" && ['add_to_library', 'place_order'].includes(action)));
+          await addClaimLog(`action:${sender.tab.id}:${sender.frameId || 0}:${action}:${success}:${detail}`, `Claim action ${action} ${success ? "succeeded" : "failed"} for ${task.gameId}${detail ? `: ${detail}` : "."}`);
+          if (!matchesPending) return;
+          if (success) {
+            await saveActiveTask({ ...task, pendingAction: null, updatedAt: Date.now() });
+            return;
+          }
+          if (!success && (action === "get" || action === "add_to_library" || action === "place_order")) {
+            const failures = (task.clickFailures || 0) + 1;
+            const recovered = {
+              ...task,
+              phase: failures >= MAX_CLICK_FAILURES ? "needs_attention" : action === "get" ? "waiting_for_get" : "awaiting_outcome",
+              terminalReason: detail || `Click ${action} failed.`,
+              clickFailures: failures,
+              clickRetriesExhausted: failures >= MAX_CLICK_FAILURES,
+              pendingAction: null,
+              updatedAt: Date.now(),
+              // Preserve the progress clock on failures so retries cannot keep a
+              // stalled task alive forever.
+              lastProgressAt: task.lastProgressAt
+            };
+            await saveActiveTask(recovered);
+            await addClaimLog(`recovery:${sender.tab.id}:${action}:${failures}`, failures >= MAX_CLICK_FAILURES
+              ? `Stopped retrying ${action} for ${task.gameId} after ${MAX_CLICK_FAILURES} failed clicks; manual attention required.`
+              : `Will retry ${action} for ${task.gameId} after failed click ${failures}/${MAX_CLICK_FAILURES}.`);
+            if (failures >= MAX_CLICK_FAILURES) {
+              await recordClaimStatus(task.platform || "epic", task.gameId, "needs_attention", recovered.terminalReason);
+            }
+          }
+        });
+      } else {
+        await addLog(`Claim action ${message.action || "unknown"} failed: missing tab context.`);
+      }
       return {};
+    case "claim-observation-log": {
+      const task = sender?.tab?.id ? await getActiveTask(sender.tab.id) : null;
+      if (!task || !isTrustedClaimFrame(sender, { frameContext: message.observation?.context, observation: message.observation })) return {};
+      const observation = message.observation || {};
+      await logClaimObservation(task, sender, observation, {
+        action: message.decision || "wait",
+        reason: message.reason || "state changed"
+      });
+      return {};
+    }
+    case "claim-observer-failed": {
+      if (!sender?.tab?.id) return {};
+      if (sender.frameId !== 0) return {};
+      const task = await getActiveTask(sender.tab.id);
+      // With all_frames, an unattached child must never terminate its tab task.
+      if (!task || !isTrustedClaimFrame(sender, message)) return {};
+      const detail = message.detail || "Claim observer could not attach to the active task.";
+      await recordClaimStatus(task.platform || "epic", task.gameId, "failed", detail);
+      await addLog(`Claim observer failed for ${task.gameId}: ${detail}`);
+      spawnedClaimTabIds.delete(sender.tab.id);
+      await removeActiveTask(sender.tab.id);
+      await chrome.tabs.remove(sender.tab.id).catch(() => {});
+      await finishSerialQueueItem(sender.tab.id, "failed", detail);
+      return {};
+    }
     case "run-claim-now":
       return { summary: await runClaimNow() };
     case "kill-instance":
@@ -214,6 +432,7 @@ async function handleMessage(message, sender) {
       await addLog(`Claim attempting for ${message.id}: ${message.detail || ""}`);
       return {};
     case "claim-result":
+      if (!isTrustedClaimFrame(sender, message)) return {};
       await recordClaimStatus(message.platform, message.id, message.status, message.detail);
       await addLog(`Claim result for ${message.id}: ${message.status} (${message.detail || ""})`);
       if (sender?.tab?.id) {
@@ -260,10 +479,23 @@ async function killInstance() {
 }
 
 async function clearLogs() {
-  const initEntry = `[${formatLogTimestamp()}] Session logs cleared.`;
-  sessionLogs = [initEntry];
-  await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
-  return { sessionLogs };
+  const clear = sessionLogMutation.then(async () => {
+    const initEntry = `[${formatLogTimestamp()}] Session logs cleared.`;
+    sessionLogs = [initEntry];
+    claimLogKeys.clear();
+    claimUniqueLogKeys.clear();
+    await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
+    return { sessionLogs };
+  }, async () => {
+    const initEntry = `[${formatLogTimestamp()}] Session logs cleared.`;
+    sessionLogs = [initEntry];
+    claimLogKeys.clear();
+    claimUniqueLogKeys.clear();
+    await chrome.storage.local.set({ [LOGS_KEY]: sessionLogs });
+    return { sessionLogs };
+  });
+  sessionLogMutation = clear.catch(() => {});
+  return clear;
 }
 
 async function ensureSettings() {
@@ -516,7 +748,11 @@ async function getOrAdoptClaimTask(tabId, pageUrl, allowAdoption = true) {
   const game = findClaimableGameForUrl(pageUrl, catalog, claimed);
   if (!game) return null;
 
-  const task = { ...createClaimTask({ gameId: game.id, tabId, now: Date.now() }), platform: game.platform || "epic", origin: "opened-page" };
+  const task = {
+    ...createClaimTask({ gameId: game.id, tabId, now: Date.now(), title: game.title, url: game.url, catalogEligible: true }),
+    platform: game.platform || "epic",
+    origin: "opened-page"
+  };
   await saveActiveTask(task);
   spawnedClaimTabIds.add(tabId);
   await addLog(`Auto-adopted opened Epic page for "${game.title}".`);
@@ -583,7 +819,11 @@ async function reconcileClaimState() {
   }
 
   if (tab && !task) {
-    const restored = { ...createClaimTask({ gameId: current.id, tabId: current.tabId, now: Date.now() }), platform: current.platform, origin: "queue-recovery" };
+    const restored = {
+      ...createClaimTask({ gameId: current.id, tabId: current.tabId, now: Date.now(), title: current.title, catalogEligible: true }),
+      platform: current.platform,
+      origin: "queue-recovery"
+    };
     await saveActiveTask(restored);
     await chrome.tabs.reload(current.tabId).catch(() => {});
     await addLog(`Recovered claim observer for "${current.title}" after a worker restart.`);
@@ -923,7 +1163,14 @@ async function queueClaim(platform, id, active = false, { serialQueue = false } 
   const [returnTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   const tab = await chrome.tabs.create({ url: "about:blank", active: Boolean(active) });
   if (!tab?.id) throw new Error("Epic claim tab could not be created.");
-  const task = createClaimTask({ gameId: game.id, tabId: tab.id, now: Date.now() });
+  const task = createClaimTask({
+    gameId: game.id,
+    tabId: tab.id,
+    now: Date.now(),
+    title: game.title,
+    url: game.url,
+    catalogEligible: true
+  });
   await saveActiveTask({
     ...task,
     platform,

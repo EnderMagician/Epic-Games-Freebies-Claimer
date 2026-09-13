@@ -141,6 +141,22 @@ test('completes when Get directly transitions to owned', () => {
   assert.equal(completed.task.phase, 'completed');
 });
 
+test('a checkout child reset to waiting_for_get can click its second Get action', () => {
+  const childTask = {
+    ...createClaimTask({ gameId: 'epic-checkout-child', tabId: 12 }),
+    phase: 'waiting_for_get'
+  };
+  const result = reduceClaimTask(childTask, {
+    ownershipVisible: false,
+    visibleActions: ['get'],
+    freeEvidence: 'confirmed',
+    blockers: []
+  }, 13);
+
+  assert.equal(result.decision.action, 'click_get');
+  assert.equal(result.task.phase, 'awaiting_outcome');
+});
+
 test('does not click Get until the page verifies a zero-cost offer', () => {
   const task = createClaimTask({ gameId: 'epic-safe-get', tabId: 4 });
   const result = reduceClaimTask(task, {
@@ -195,6 +211,8 @@ test('pauses instead of clicking through a blocker or unknown price', () => {
 test('normalizes Epic labels, ownership, price, and blockers into one observation', () => {
   const observation = buildEpicObservation({
     bodyText: 'Your total $0.00 CAPTCHA required',
+    context: 'checkout',
+    checkoutRegions: ['Your total $0.00'],
     buttons: [
       { label: 'Add to Library', visible: true, disabled: false },
       { label: 'Get', visible: false, disabled: false }
@@ -213,6 +231,47 @@ test('does not treat a generic Free label as checkout price evidence', () => {
   });
 
   assert.equal(observation.freeEvidence, 'unknown');
+});
+
+test('scopes product eligibility to a free CTA and tolerates the original price', () => {
+  const observation = buildEpicObservation({
+    context: 'product',
+    catalogEligible: true,
+    bodyText: 'Game page $999.99 unrelated banner',
+    ctaRegions: ['$19.99 Free Get'],
+    buttons: [{ label: 'Get', visible: true, disabled: false }]
+  });
+  assert.equal(observation.offerEvidence, 'confirmed');
+  assert.equal(observation.freeEvidence, 'confirmed');
+});
+
+test('refuses a paid checkout even when the product was catalog eligible', () => {
+  const task = { ...createClaimTask({ gameId: 'epic-paid-checkout', tabId: 8 }), phase: 'awaiting_outcome', offerVerified: true };
+  const result = reduceClaimTask(task, {
+    context: 'checkout',
+    visibleActions: ['place_order'],
+    offerEvidence: 'confirmed',
+    checkoutTotalEvidence: 'nonzero',
+    catalogEligible: true,
+    blockers: []
+  }, 9);
+  assert.equal(result.decision.action, 'wait');
+  assert.match(result.decision.reason, /nonzero/i);
+});
+
+test('recognizes grouped nonzero VND checkout totals as paid', () => {
+  assert.equal(buildEpicObservation({ context: 'checkout', checkoutRegions: ['Total 100.000 ₫'], buttons: [{ label: 'Place Order' }] }).checkoutTotalEvidence, 'nonzero');
+  assert.equal(buildEpicObservation({ context: 'checkout', checkoutRegions: ['Total 10,000 ₫'], buttons: [{ label: 'Place Order' }] }).checkoutTotalEvidence, 'nonzero');
+});
+
+test('clearing a post-order blocker resumes waiting without placing a second order', () => {
+  const task = { ...createClaimTask({ gameId: 'epic-confirmed', tabId: 8 }), phase: 'confirmation_clicked' };
+  const paused = reduceClaimTask(task, { blockers: ['captcha'] }, 10);
+  const resumed = reduceClaimTask(paused.task, {
+    context: 'checkout', checkoutTotalEvidence: 'confirmed', visibleActions: ['place_order'], blockers: []
+  }, 11);
+  assert.equal(resumed.task.phase, 'confirmation_clicked');
+  assert.equal(resumed.decision.action, 'wait');
 });
 
 test('adopts a manually opened current freebie URL when it is not claimed', () => {

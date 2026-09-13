@@ -5,9 +5,12 @@
 })(typeof globalThis === 'object' ? globalThis : self, () => {
   const TERMINAL_PHASES = new Set(['completed', 'failed']);
 
-  function createClaimTask({ gameId, tabId, frameId = 0, now = Date.now() }) {
+  function createClaimTask({ gameId, tabId, frameId = 0, now = Date.now(), title = null, url = null, catalogEligible = false }) {
     return {
       gameId,
+      title,
+      url,
+      catalogEligible: Boolean(catalogEligible),
       tabId,
       frameId,
       phase: 'waiting_for_get',
@@ -36,23 +39,35 @@
     }
 
     const actions = new Set(observation.visibleActions || []);
-    const hasClaimAction = actions.has('get') || actions.has('add_to_library') || actions.has('place_order');
-    const hasConfirmationAction = actions.has('add_to_library') || actions.has('place_order');
     const blockers = (Array.isArray(observation.blockers) ? observation.blockers : [])
-      .filter((blocker) => blocker !== 'login' || !hasClaimAction)
-      .filter((blocker) => blocker !== 'terms' || !hasConfirmationAction);
+      .filter((blocker, index, all) => all.indexOf(blocker) === index);
     if (blockers.length > 0) {
+      if (current.phase !== 'needs_attention') current.resumePhase = current.phase;
       current.phase = 'needs_attention';
       current.terminalReason = blockers.join(', ');
       current.lastProgressAt = now;
       return { task: current, decision: decision('needs_attention', `Manual attention required: ${current.terminalReason}`) };
     }
+    if (current.phase === 'needs_attention') {
+      current.phase = current.resumePhase || 'waiting_for_get';
+      current.terminalReason = null;
+    }
 
-    const canConfirm = observation.freeEvidence === 'confirmed' && (actions.has('add_to_library') || actions.has('place_order'));
+    const isLegacyObservation = !observation.context && !('checkoutTotalEvidence' in observation) && !('offerEvidence' in observation);
+    const offerEvidence = observation.offerEvidence || (isLegacyObservation ? observation.freeEvidence : 'unknown');
+    const checkoutEvidence = observation.checkoutTotalEvidence
+      || (isLegacyObservation ? observation.freeEvidence : 'unknown');
+    const productEligible = offerEvidence !== 'nonzero' && (observation.catalogEligible === true
+      || offerEvidence === 'confirmed'
+      || (isLegacyObservation && observation.freeEvidence === 'confirmed'));
+    const checkoutFree = checkoutEvidence === 'confirmed' && checkoutEvidence !== 'nonzero';
+    const canConfirm = checkoutFree && current.offerVerified !== false
+      && (actions.has('add_to_library') || actions.has('place_order'));
 
-    if ((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') && actions.has('get') && observation.freeEvidence === 'confirmed') {
+    if ((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') && actions.has('get') && productEligible) {
       current.phase = 'awaiting_outcome';
       current.terminalReason = null;
+      current.offerVerified = true;
       current.attempts += 1;
       current.lastProgressAt = now;
       return { task: current, decision: decision('click_get', 'Visible Get action is available.') };
@@ -62,10 +77,18 @@
       current.phase = 'confirmation_clicked';
       current.terminalReason = null;
       current.attempts += 1;
+      current.lastProgressAt = now;
       return { task: current, decision: decision('click_confirm', 'Verified zero-cost confirmation action is available.') };
     }
 
-    return { task: current, decision: decision('wait', 'Waiting for Epic page state to settle.') };
+    const reason = actions.has('get') && !productEligible
+      ? offerEvidence === 'nonzero' ? 'Refusing Get: current CTA offer is not free.' : 'Waiting for Epic page state to settle; waiting for scoped product price evidence.'
+      : (actions.has('add_to_library') || actions.has('place_order')) && !checkoutFree
+        ? checkoutEvidence === 'nonzero' ? 'Refusing confirmation: checkout total is nonzero.' : 'Waiting for checkout total verification.'
+        : current.phase === 'confirmation_clicked' ? 'Waiting for Epic to confirm ownership after the order click.'
+          : current.phase === 'awaiting_outcome' ? 'Waiting for checkout or ownership after Get.'
+            : 'Waiting for Epic page state to settle.';
+    return { task: current, decision: decision('wait', reason) };
   }
 
   return { createClaimTask, reduceClaimTask };
