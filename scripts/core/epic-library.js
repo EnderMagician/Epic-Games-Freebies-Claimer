@@ -110,5 +110,72 @@
     return { claimedGames: claimed, added, updated };
   }
 
-  return { ORDER_HISTORY_URL, orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed, normalizeTitle };
+  // Imported order-history items carry only a title. Epic's public store-content
+  // API is keyed by product slug, which for most catalog games is the title in
+  // kebab case; editions usually live under the base game's slug.
+  const STORE_CONTENT_URL = 'https://store-content-ipv4.ak.epicgames.com/api/en-US/content/products/';
+
+  function titleSlug(title) {
+    // Strip trademark marks first: NFKD would expand "™" into the letters "TM".
+    return String(title || '').replace(/['\u2019\u2122\u00ae\u00a9]/g, '').normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/&/g, 'and')
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  }
+
+  function thumbnailSlugCandidates(title) {
+    const value = String(title || '');
+    const candidates = [titleSlug(value)];
+    for (const separator of [':', ' - ', ' \u2013 ', ' \u2014 ']) {
+      if (value.includes(separator)) candidates.push(titleSlug(value.split(separator)[0]));
+    }
+    return [...new Set(candidates.filter((slug) => slug.length >= 2))];
+  }
+
+  function productMatchesTitle(productName, title) {
+    if (!productName) return true;
+    const product = normalizeTitle(productName);
+    const wanted = normalizeTitle(title);
+    return product === wanted || wanted.startsWith(product) || product.startsWith(wanted);
+  }
+
+  // Prefer landscape key art; fall back to the first screenshot.
+  function extractStoreContentImage(payload, title) {
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.pages)) return null;
+    if (!productMatchesTitle(payload.productName, title)) return null;
+    const pages = [...payload.pages].sort((left, right) => (left?._slug === 'home' ? -1 : 0) - (right?._slug === 'home' ? -1 : 0));
+    for (const page of pages) {
+      const data = page?.data || {};
+      const url = data.hero?.backgroundImageUrl
+        || data.carousel?.items?.find((item) => item?.image?.src)?.image?.src
+        || (Array.isArray(page?._images_) ? page._images_.find((src) => typeof src === 'string') : null)
+        || data.gallery?.galleryImages?.find((image) => image?.src)?.src
+        || data.about?.image?.src;
+      if (typeof url === 'string' && /^https:\/\//.test(url)) return url;
+    }
+    return null;
+  }
+
+  // Library thumbnails render at 56x34 CSS px; 112px wide covers 2x screens.
+  // Epic's image CDNs resize on the fly, cutting a cover to roughly 2 KB.
+  const THUMBNAIL_WIDTH = 112;
+
+  function thumbnailUrl(url, width = THUMBNAIL_WIDTH) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' || !/(?:^|\.)(?:epicgames\.com|unrealengine\.com)$/i.test(parsed.hostname)) return url;
+      parsed.search = '';
+      parsed.searchParams.set('resize', '1');
+      parsed.searchParams.set('w', String(width));
+      parsed.searchParams.set('quality', 'low');
+      return parsed.toString();
+    } catch (error) {
+      return url;
+    }
+  }
+
+  return {
+    THUMBNAIL_WIDTH, thumbnailUrl,
+    ORDER_HISTORY_URL, STORE_CONTENT_URL, orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed,
+    normalizeTitle, titleSlug, thumbnailSlugCandidates, extractStoreContentImage
+  };
 });

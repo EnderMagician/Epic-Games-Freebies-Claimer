@@ -5,14 +5,23 @@ let loadQueued = false;
 const LIBRARY_PAGE_SIZE = 60;
 const RECENT_DAYS = 14;
 const library = { query: "", filter: "all", sort: "newest", limit: LIBRARY_PAGE_SIZE, dataKey: "", viewKey: "", observer: null };
+const THUMBS_KEY = "libraryThumbs";
+// Covers cached once by the background worker as small data URLs.
+let thumbs = {};
+let thumbsVersion = 0;
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  await loadThumbs();
   await loadState();
+  // Cheap when everything is cached: the worker only looks up missing covers.
+  send({ type: "resolve-thumbnails" });
   setInterval(() => loadState(), 5000);
 });
 
 function bindEvents() {
+  for (const select of document.querySelectorAll("select[data-dropdown]")) enhanceSelect(select);
+
   // Refresh catalog (force fetch new data)
   $("#refresh")?.addEventListener("click", async () => {
     const btn = $("#refresh");
@@ -204,6 +213,21 @@ function bindEvents() {
   });
 }
 
+async function loadThumbs() {
+  try {
+    const stored = await chrome.storage.local.get(THUMBS_KEY);
+    thumbs = stored[THUMBS_KEY] || {};
+  } catch (error) {
+    thumbs = {};
+  }
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== "local" || !changes[THUMBS_KEY]) return;
+    thumbs = changes[THUMBS_KEY].newValue || {};
+    thumbsVersion += 1;
+    renderClaimedOnMain(state.claimedGames || []);
+  });
+}
+
 async function loadState() {
   if (loadInFlight) {
     loadQueued = true;
@@ -275,7 +299,10 @@ function render() {
   // Switches
   if ($("#auto-claim")) $("#auto-claim").checked = settings.autoClaim;
   if ($("#run-on-startup")) $("#run-on-startup").checked = settings.runOnStartup ?? true;
-  if ($("#country")) $("#country").value = settings.country || "VN";
+  if ($("#country")) {
+    $("#country").value = settings.country || "VN";
+    syncDropdown($("#country"));
+  }
 
   // Manual Start button state
   const runNow = $("#run-now");
@@ -333,7 +360,7 @@ function renderGames(platform, games) {
     const card = $("#game-template").content.firstElementChild.cloneNode(true);
     makeGameCardOpenable(card, game);
     const image = card.querySelector(".cover");
-    image.src = game.image || "";
+    image.src = game.image ? thumbnailSrc(game.image, 128) : "";
     image.alt = "";
     image.addEventListener("error", () => image.remove());
     card.querySelector(".title").textContent = game.title;
@@ -369,7 +396,7 @@ function renderGames(platform, games) {
 // month-grouped full view that renders lazily (accounts often own 200+ games).
 function renderClaimedOnMain(games) {
   const claimed = newestClaimedGames(games);
-  const dataKey = claimed.map((game) => `${game.id}:${game.claimedAt || ""}:${game.image ? 1 : 0}`).join("|");
+  const dataKey = `${thumbsVersion}#` + claimed.map((game) => `${game.id}:${game.claimedAt || ""}:${game.image ? 1 : 0}`).join("|");
   if (dataKey === library.dataKey) return;
   library.dataKey = dataKey;
 
@@ -551,12 +578,13 @@ function createClaimedRow(game, { highlight = "", showYear = false } = {}) {
   const thumb = card.querySelector(".lib-thumb");
   thumb.style.setProperty("--hue", String(titleHue(game.title)));
   card.querySelector(".lib-monogram").textContent = monogram(game.title);
-  if (game.image) {
+  const src = thumbs[game.id] || (game.image ? thumbnailSrc(game.image) : "");
+  if (src) {
     const img = document.createElement("img");
     img.alt = "";
     img.loading = "lazy";
     img.decoding = "async";
-    img.src = game.image;
+    img.src = src;
     img.addEventListener("error", () => img.remove());
     thumb.append(img);
   }
@@ -570,6 +598,18 @@ function createClaimedRow(game, { highlight = "", showYear = false } = {}) {
   source.title = fromAccount ? "Found in your Epic order history" : "Claimed by this extension";
   if (Date.now() - claimedTime(game) < RECENT_DAYS * 86_400_000) card.classList.add("is-recent");
   return card;
+}
+
+// Until the worker caches a cover, ask Epic's CDN for a ~2 KB 112px version.
+function thumbnailSrc(url, width = 112) {
+  try {
+    const parsed = new URL(url);
+    if (!/(?:^|\.)(?:epicgames\.com|unrealengine\.com)$/i.test(parsed.hostname)) return url;
+    parsed.search = `?resize=1&w=${width}&quality=low`;
+    return parsed.toString();
+  } catch (error) {
+    return url;
+  }
 }
 
 function appendHighlighted(element, text, query) {
@@ -735,4 +775,121 @@ function formatLogDateLabel(dateKey) {
   if (dateKey === todayKey) return "Today";
   if (dateKey === yesterdayKey) return "Yesterday";
   return date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+// Themed replacement for a native <select>: Chrome cannot style the native
+// option menu. The hidden select stays the source of truth and still fires
+// "change", so existing handlers keep working.
+const dropdownSyncs = new WeakMap();
+
+function syncDropdown(select) {
+  dropdownSyncs.get(select)?.();
+}
+
+function enhanceSelect(select) {
+  const wrap = document.createElement("div");
+  wrap.className = `m3-dropdown ${select.dataset.dropdown ? `m3-dropdown--${select.dataset.dropdown}` : ""}`;
+  select.before(wrap);
+  wrap.append(select);
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+
+  const menuId = `${select.id}-menu`;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "m3-dropdown-btn";
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-controls", menuId);
+  button.setAttribute("aria-label", select.getAttribute("aria-label") || select.title || "Choose an option");
+  const label = document.createElement("span");
+  label.className = "m3-dropdown-label";
+  button.append(label);
+  button.insertAdjacentHTML("beforeend", '<svg class="m3-dropdown-chevron" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="6 9 12 15 18 9"/></svg>');
+
+  const menu = document.createElement("div");
+  menu.id = menuId;
+  menu.className = "m3-dropdown-menu";
+  menu.setAttribute("role", "listbox");
+  menu.hidden = true;
+  const options = [...select.options].map((option) => {
+    const item = document.createElement("div");
+    item.className = "m3-dropdown-option";
+    item.setAttribute("role", "option");
+    item.tabIndex = -1;
+    item.dataset.value = option.value;
+    const text = document.createElement("span");
+    text.textContent = option.textContent;
+    item.append(text);
+    item.insertAdjacentHTML("beforeend", '<svg class="m3-dropdown-check" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.6"><polyline points="20 6 9 17 4 12"/></svg>');
+    menu.append(item);
+    return item;
+  });
+  wrap.append(button, menu);
+
+  const sync = () => {
+    const current = select.options[select.selectedIndex];
+    label.textContent = current?.dataset.short || current?.textContent || "";
+    for (const item of options) item.setAttribute("aria-selected", String(item.dataset.value === select.value));
+  };
+  const isOpen = () => !menu.hidden;
+  const close = (focusButton) => {
+    if (!isOpen()) return;
+    menu.hidden = true;
+    wrap.classList.remove("is-open", "drop-up");
+    button.setAttribute("aria-expanded", "false");
+    if (focusButton) button.focus();
+  };
+  const open = () => {
+    for (const other of document.querySelectorAll(".m3-dropdown.is-open")) if (other !== wrap) other.querySelector(".m3-dropdown-btn")?.dispatchEvent(new CustomEvent("dropdown-close"));
+    menu.hidden = false;
+    wrap.classList.add("is-open");
+    // Open upward when the popup has no room below (e.g. the region setting).
+    const rect = button.getBoundingClientRect();
+    wrap.classList.toggle("drop-up", rect.bottom + menu.offsetHeight + 8 > window.innerHeight && rect.top > menu.offsetHeight + 8);
+    button.setAttribute("aria-expanded", "true");
+    (options.find((item) => item.dataset.value === select.value) || options[0])?.focus();
+  };
+  const choose = (value) => {
+    if (select.value !== value) {
+      select.value = value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    sync();
+    close(true);
+  };
+
+  button.addEventListener("dropdown-close", () => close(false));
+  button.addEventListener("click", () => (isOpen() ? close(true) : open()));
+  button.addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      open();
+    }
+  });
+  menu.addEventListener("click", (event) => {
+    const item = event.target.closest(".m3-dropdown-option");
+    if (item) choose(item.dataset.value);
+  });
+  menu.addEventListener("keydown", (event) => {
+    const index = options.indexOf(document.activeElement);
+    const move = (next) => options[(next + options.length) % options.length]?.focus();
+    if (event.key === "ArrowDown") move(index + 1);
+    else if (event.key === "ArrowUp") move(index - 1);
+    else if (event.key === "Home") move(0);
+    else if (event.key === "End") move(options.length - 1);
+    else if ((event.key === "Enter" || event.key === " ") && index >= 0) choose(options[index].dataset.value);
+    else if (event.key === "Escape") close(true);
+    else if (event.key === "Tab") close(false);
+    else return;
+    event.preventDefault();
+    // Keep Escape from also closing the library view behind the menu.
+    event.stopPropagation();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (isOpen() && !wrap.contains(event.target)) close(false);
+  });
+  select.addEventListener("change", sync);
+  dropdownSyncs.set(select, sync);
+  sync();
 }

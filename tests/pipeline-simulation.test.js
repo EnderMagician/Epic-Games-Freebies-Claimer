@@ -37,6 +37,7 @@ function createExtensionEnvironment(options = {}) {
     customFetch,
     orderHistory = null,
     loginState = null,
+    storeContent = {},
     cookies = [
       { name: 'EPIC_BEARER_TOKEN', value: 'fake-token', domain: '.epicgames.com', path: '/' },
       { name: 'EPIC_SSO', value: 'fake-sso', domain: '.epicgames.com', path: '/' }
@@ -200,6 +201,20 @@ function createExtensionEnvironment(options = {}) {
     if (urlStr.includes('ajaxGetOrderHistory') && orderHistory) {
       const payload = typeof orderHistory === 'function' ? orderHistory(urlStr) : orderHistory;
       return { ok: true, status: 200, json: async () => payload };
+    }
+    if (urlStr.includes('/content/products/')) {
+      const slug = decodeURIComponent(urlStr.split('/content/products/')[1]);
+      return storeContent[slug]
+        ? { ok: true, status: 200, json: async () => storeContent[slug] }
+        : { ok: false, status: 404, json: async () => ({}) };
+    }
+    if (urlStr.startsWith('https://cdn2.unrealengine.com/')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (name) => (name.toLowerCase() === 'content-type' ? 'image/jpeg' : null) },
+        arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xe1]).buffer
+      };
     }
     if (urlStr.includes('/id/api/login/state') && loginState) {
       const payload = typeof loginState === 'function' ? loginState() : loginState;
@@ -1206,6 +1221,43 @@ test('Pipeline Simulation: A password prompt on Epic sign-in pauses the claim in
   assert.match(result.decision.reason, /password/);
   const after = await env.sendMessage({ type: 'get-state' });
   assert.equal(after.claimedGames.find((g) => g.id === 'epic-promo-1').status, 'needs_attention');
+});
+
+test('Pipeline Simulation: Library covers are downloaded once, resized, and cached apart from claim state', async () => {
+  const env = createExtensionEnvironment({
+    initialStorage: {
+      claimedGames: [
+        { id: 'epic-a', platform: 'epic', title: 'Shadow Tactics: Blades of the Shogun', status: 'owned', source: 'epic_account' },
+        { id: 'epic-b', platform: 'epic', title: 'Unknown Indie', status: 'owned', source: 'epic_account' },
+        { id: 'epic-c', platform: 'epic', title: 'Game Alpha', status: 'claimed', image: 'https://cdn1.epicgames.com/game-alpha/wide.jpg' }
+      ]
+    },
+    storeContent: {
+      'shadow-tactics': { productName: 'Shadow Tactics', pages: [{ _slug: 'home', data: { hero: { backgroundImageUrl: 'https://cdn2.unrealengine.com/st.jpg' } } }] }
+    }
+  });
+
+  await env.sendMessage({ type: 'resolve-thumbnails' });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const thumbs = env.storageLocalStore.libraryThumbs;
+  assert.match(thumbs['epic-a'], /^data:image\/jpeg;base64,/);
+  assert.match(thumbs['epic-c'], /^data:image\/jpeg;base64,/);
+  assert.equal(thumbs['epic-b'], undefined);
+  const records = new Map(env.storageLocalStore.claimedGames.map((game) => [game.id, game]));
+  assert.equal(records.get('epic-a').image, 'https://cdn2.unrealengine.com/st.jpg');
+  assert.ok(records.get('epic-b').imageCheckedAt, 'a miss is stamped so it is not retried soon');
+  assert.ok(env.fetchLog.some((url) => url.startsWith('https://cdn2.unrealengine.com/st.jpg?resize=1&w=112&quality=low')));
+
+  const state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(JSON.stringify(state).includes('data:image'), false, 'the polled state never carries image bytes');
+
+  const fetchesBefore = env.fetchLog.length;
+  await env.sendMessage({ type: 'resolve-thumbnails' });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(env.fetchLog.filter((url) => url.includes('/content/products/') || url.includes('unrealengine')).length,
+    env.fetchLog.slice(0, fetchesBefore).filter((url) => url.includes('/content/products/') || url.includes('unrealengine')).length,
+    'a second pass fetches nothing');
 });
 
 test('Pipeline Simulation: Slow tab loading with delayed DOM hydration handles multiple wait steps without miss timing', async () => {

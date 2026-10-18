@@ -468,3 +468,24 @@ test('classifies Epic\'s "Welcome back" account picker conservatively', () => {
   assert.equal(classifyAccountPicker({ url: 'https://www.epicgames.com/id/login?lang=en-US', bodyText: 'Sign in', hasPasswordField: true }).state, 'password');
   assert.equal(classifyAccountPicker({ url: 'https://store.epicgames.com/en-US/p/x', bodyText: 'Welcome back', candidates: ['GamerOne'] }).state, 'none');
 });
+
+test('derives store-content slugs and picks landscape cover art', () => {
+  const { thumbnailSlugCandidates, extractStoreContentImage, thumbnailUrl } = require('../scripts/core/epic-library.js');
+  assert.deepEqual(thumbnailSlugCandidates("Them's Fightin' Herds"), ['thems-fightin-herds']);
+  assert.deepEqual(thumbnailSlugCandidates('Shadow Tactics: Blades of the Shogun'), ['shadow-tactics-blades-of-the-shogun', 'shadow-tactics']);
+  assert.deepEqual(thumbnailSlugCandidates('LEGO® Batman™ & Robin'), ['lego-batman-and-robin']);
+
+  const payload = {
+    productName: 'Shadow Tactics',
+    pages: [
+      { _slug: 'deluxe', data: { hero: { backgroundImageUrl: 'https://cdn2.unrealengine.com/deluxe.jpg' } } },
+      { _slug: 'home', data: { hero: { backgroundImageUrl: '' }, carousel: { items: [{ image: { src: 'https://cdn2.unrealengine.com/home.jpg' } }] } } }
+    ]
+  };
+  assert.equal(extractStoreContentImage(payload, 'Shadow Tactics: Blades of the Shogun'), 'https://cdn2.unrealengine.com/home.jpg');
+  assert.equal(extractStoreContentImage({ ...payload, productName: 'Shadow Warrior' }, 'Shadow Tactics'), null, 'a different product is rejected');
+  assert.equal(extractStoreContentImage({}, 'x'), null);
+
+  assert.equal(thumbnailUrl('https://cdn1.epicgames.com/offer/a/b.jpg?h=480'), 'https://cdn1.epicgames.com/offer/a/b.jpg?resize=1&w=112&quality=low');
+  assert.equal(thumbnailUrl('https://example.com/a.jpg'), 'https://example.com/a.jpg');
+});

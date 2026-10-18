@@ -6,7 +6,7 @@ const { fetchLoginState: fetchEpicLoginState } = FreebiesAuthClient;
 const { createClaimTask, reduceClaimTask } = FreebiesClaimMachine;
 const { findClaimableGameForUrl } = FreebiesClaimRouting;
 const { createClaimQueue, beginNextClaim, rebindCurrentClaim, finishCurrentClaim, skipNextClaim, cancelClaimQueue } = FreebiesClaimQueue;
-const { orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed } = FreebiesEpicLibrary;
+const { orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed, STORE_CONTENT_URL, thumbnailSlugCandidates, extractStoreContentImage, thumbnailUrl } = FreebiesEpicLibrary;
 
 const CATALOG_KEY = "catalog";
 const CLAIMED_KEY = "claimedGames";
@@ -18,6 +18,9 @@ const CLAIM_QUEUE_KEY = "claimQueue";
 const STORAGE_VERSION_KEY = "storageSchemaVersion";
 const MIGRATION_BACKUP_KEY = "migrationBackupV2";
 const LIBRARY_KEY = "epicLibrary";
+// Kept apart from claimedGames so the 5-second popup poll never carries image bytes.
+const THUMBS_KEY = "libraryThumbs";
+const THUMBNAIL_MAX_BYTES = 12_000;
 const SCHEDULE_STATE_KEY = "scheduleState";
 const ALARM_NAME = "freebies-daily-check";
 const CLAIM_WATCHDOG_ALARM = "freebies-claim-watchdog";
@@ -35,6 +38,8 @@ const NEEDS_ATTENTION_TIMEOUT_MS = 15 * 60 * 1000;
 const AUTO_RETRY_COOLDOWN_MS = 3 * 60 * 60 * 1000;
 const CLAIMED_LIMIT = 2000;
 const MAX_ACCOUNT_PICKS = 2;
+const THUMBNAIL_RETRY_MS = 30 * 24 * 60 * 60 * 1000;
+const THUMBNAIL_CONCURRENCY = 4;
 const ACCOUNT_PICK_INTERVAL_MS = 8000;
 const AUTH_CACHE_TTL_MS = 15000;
 const AUTH_CHANGE_DEBOUNCE_MS = 750;
@@ -54,6 +59,7 @@ let claimStateMutation = Promise.resolve();
 let claimQueueLock = Promise.resolve();
 let scheduledCheckPromise = null;
 let librarySyncPromise = null;
+let thumbnailPromise = null;
 let sessionLogMutation = Promise.resolve();
 const claimTaskMutations = new Map();
 const claimLogKeys = new Map();
@@ -586,6 +592,10 @@ async function handleMessage(message, sender) {
       return { summary: await runClaimNow() };
     case "sync-library":
       return { library: await syncEpicLibrary({ force: true }) };
+    case "resolve-thumbnails":
+      // Fire and forget: covers stream into storage and the popup poll picks them up.
+      void resolveLibraryThumbnails().catch(() => {});
+      return {};
     case "kill-instance":
       return withQueueLock(killInstance);
     case "clear-logs":
@@ -1545,13 +1555,17 @@ async function showClaimSuccessNotification(game) {
   }
 }
 
-async function fetchNotificationImageDataUrl(imageUrl) {
+function fetchNotificationImageDataUrl(imageUrl) {
+  return fetchImageDataUrl(imageUrl, NOTIFICATION_COVER_TIMEOUT_MS);
+}
+
+async function fetchImageDataUrl(imageUrl, timeoutMs) {
   const url = new URL(imageUrl);
   if (url.protocol === "data:" || url.protocol === "blob:") return url.toString();
   if (url.protocol !== "https:") throw new Error("Game cover must use HTTPS.");
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), NOTIFICATION_COVER_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url.toString(), {
       credentials: "omit",
@@ -1657,7 +1671,84 @@ async function syncEpicLibraryOnce({ force = false, quiet = false } = {}) {
   if (!quiet || merged.added || merged.updated || previous.error) {
     await addLog(`Epic library synced: ${items.length} owned item(s) on the account, ${merged.added} imported, ${merged.updated} marked owned.`);
   }
+  if (merged.added) void resolveLibraryThumbnails().catch(() => {});
   return state;
+}
+
+function resolveLibraryThumbnails() {
+  if (thumbnailPromise) return thumbnailPromise;
+  thumbnailPromise = resolveLibraryThumbnailsOnce().finally(() => { thumbnailPromise = null; });
+  return thumbnailPromise;
+}
+
+// Each cover is looked up and downloaded once, as a ~2 KB data URL kept under
+// its own storage key; the library then renders without touching the network.
+// A game with no cover is stamped and retried only after 30 days.
+async function resolveLibraryThumbnailsOnce() {
+  const now = Date.now();
+  const thumbs = (await chrome.storage.local.get(THUMBS_KEY).catch(() => ({})))[THUMBS_KEY] || {};
+  const pending = (await getEpicClaimedGames()).filter((game) => isClaimCompleted(game) && !thumbs[game.id]
+    && (game.image || now - (Date.parse(game.imageCheckedAt || "") || 0) >= THUMBNAIL_RETRY_MS));
+  if (!pending.length) return { found: 0, checked: 0 };
+
+  const recordUpdates = new Map();
+  const thumbUpdates = new Map();
+  const flush = async () => {
+    if (!recordUpdates.size && !thumbUpdates.size) return;
+    const records = new Map(recordUpdates);
+    const images = Object.fromEntries(thumbUpdates);
+    recordUpdates.clear();
+    thumbUpdates.clear();
+    // Re-read both keys so writes made meanwhile are not overwritten.
+    const stored = await chrome.storage.local.get(THUMBS_KEY).catch(() => ({}));
+    const claimed = (await getEpicClaimedGames()).map((game) => records.has(game.id) ? { ...game, ...records.get(game.id) } : game);
+    await chrome.storage.local.set({ [CLAIMED_KEY]: claimed, [THUMBS_KEY]: { ...(stored[THUMBS_KEY] || {}), ...images } });
+  };
+
+  let found = 0;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < pending.length) {
+      const game = pending[cursor++];
+      const checkedAt = new Date().toISOString();
+      const image = game.image || await fetchStoreContentThumbnail(game.title).catch(() => null);
+      const dataUrl = image ? await fetchThumbnailDataUrl(image).catch(() => null) : null;
+      if (dataUrl) {
+        found += 1;
+        thumbUpdates.set(game.id, dataUrl);
+      }
+      recordUpdates.set(game.id, image && !game.image
+        ? { image, imageSource: "store-content", imageCheckedAt: checkedAt }
+        : { imageCheckedAt: checkedAt });
+      if (recordUpdates.size >= 20) await flush();
+    }
+  };
+  await Promise.all(Array.from({ length: THUMBNAIL_CONCURRENCY }, worker));
+  await flush();
+  await addLog(`Library covers: saved ${found} of ${pending.length} missing cover(s).`);
+  return { found, checked: pending.length };
+}
+
+async function fetchThumbnailDataUrl(imageUrl) {
+  const dataUrl = await fetchImageDataUrl(thumbnailUrl(imageUrl), 8000);
+  // Skip CDNs that ignored the resize request; the popup can still load the URL lazily.
+  return dataUrl.length <= THUMBNAIL_MAX_BYTES * 4 / 3 + 64 ? dataUrl : null;
+}
+
+async function fetchStoreContentThumbnail(title) {
+  for (const slug of thumbnailSlugCandidates(title)) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(STORE_CONTENT_URL + encodeURIComponent(slug), { credentials: "omit", signal: controller.signal });
+      if (!response.ok) continue;
+      const image = extractStoreContentImage(await response.json().catch(() => null), title);
+      if (image) return image;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
 }
 
 async function getEpicClaimedGames() {

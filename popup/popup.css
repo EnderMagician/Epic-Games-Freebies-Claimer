@@ -1210,3 +1210,131 @@ main {
 @media (prefers-reduced-motion: reduce) {
   .lib { animation: none; }
 }
+
+/* ---------- Themed dropdown (replaces native select menus) ---------- */
+
+.m3-dropdown {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.m3-dropdown > select {
+  display: none;
+}
+
+.m3-dropdown-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  border: 1px solid var(--m3-outline);
+  background: var(--m3-surface-container-high);
+  color: var(--m3-on-surface);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.m3-dropdown-btn:hover { background: var(--m3-surface-container-highest); }
+.m3-dropdown-btn:focus-visible { outline: 2px solid var(--m3-primary); outline-offset: 1px; }
+.m3-dropdown.is-open .m3-dropdown-btn { border-color: var(--m3-primary); }
+
+.m3-dropdown--compact .m3-dropdown-btn {
+  min-width: 120px;
+  height: 28px;
+  padding: 0 8px 0 12px;
+  border-radius: 8px;
+  font-size: 10.5px;
+}
+
+.m3-dropdown--toolbar .m3-dropdown-btn {
+  min-width: 92px;
+  height: 34px;
+  padding: 0 10px 0 14px;
+  border-color: transparent;
+  border-radius: 9999px;
+  font-size: 11px;
+}
+
+.m3-dropdown-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.m3-dropdown-chevron {
+  flex-shrink: 0;
+  color: var(--m3-on-surface-variant);
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-dropdown.is-open .m3-dropdown-chevron {
+  color: var(--m3-primary);
+  transform: rotate(180deg);
+}
+
+.m3-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 300;
+  min-width: 100%;
+  padding: 4px;
+  border: 1px solid var(--m3-outline-variant);
+  border-radius: 12px;
+  background: var(--m3-surface-container-highest);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  transform-origin: top right;
+  animation: dropdown-in 0.14s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m3-dropdown.drop-up .m3-dropdown-menu {
+  top: auto;
+  bottom: calc(100% + 4px);
+  transform-origin: bottom right;
+}
+
+.m3-dropdown-menu[hidden] { display: none; }
+
+@keyframes dropdown-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+
+.m3-dropdown-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--m3-on-surface);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  outline: none;
+}
+
+.m3-dropdown-option:hover,
+.m3-dropdown-option:focus {
+  background: rgba(208, 188, 255, 0.1);
+}
+
+.m3-dropdown-option[aria-selected="true"] {
+  color: var(--m3-primary);
+  font-weight: 700;
+}
+
+.m3-dropdown-check {
+  visibility: hidden;
+}
+
+.m3-dropdown-option[aria-selected="true"] .m3-dropdown-check {
+  visibility: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m3-dropdown-menu { animation: none; }
+}

@@ -126,11 +126,11 @@
                 <span class="setting-label">Store Region</span>
                 <span class="setting-desc">Epic Games Store catalog region</span>
               </div>
-              <select id="country" class="m3-select">
-                <option value="VN">🇻🇳 Vietnam (VN)</option>
-                <option value="US">🇺🇸 United States (US)</option>
-                <option value="GB">🇬🇧 United Kingdom (GB)</option>
-                <option value="CA">🇨🇦 Canada (CA)</option>
+              <select id="country" class="m3-select" data-dropdown="compact" aria-label="Store region">
+                <option value="VN" data-short="Vietnam">Vietnam (VN)</option>
+                <option value="US" data-short="United States">United States (US)</option>
+                <option value="GB" data-short="United Kingdom">United Kingdom (GB)</option>
+                <option value="CA" data-short="Canada">Canada (CA)</option>
               </select>
             </div>
           </div>
@@ -166,7 +166,7 @@
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
             <input id="lib-search" type="search" placeholder="Search games" autocomplete="off" spellcheck="false" aria-label="Search library" />
           </label>
-          <select id="lib-sort" class="lib-sort" aria-label="Sort library">
+          <select id="lib-sort" class="lib-sort" data-dropdown="toolbar" aria-label="Sort library">
             <option value="newest">Newest</option>
             <option value="oldest">Oldest</option>
             <option value="title">A–Z</option>
