@@ -76,6 +76,7 @@ The main popup shows the three newest games. Click the card to open the full Lib
 - **Scheduled scans** run on browser startup, every hour, and a few minutes after the next promotion starts or ends (taken from Epic's catalog). Disabling it leaves only Manual Start.
 - On startup the Epic login is often not ready yet; the scan retries every minute (up to five times) and also runs as soon as Epic reports a login.
 - An unattended scan waits three hours before retrying a game that just failed; Manual Start always retries immediately.
+- While a scan runs, **Manual Start** shows **Checking…** (fetching the catalog and library) or **Claiming…** (queue running). The scan lives in the background worker, so closing the popup is safe; clicking again or reopening the popup joins the scan in progress, and its result stays on screen for ten seconds.
 - **Store Region** controls the Epic catalog country used for giveaway detection.
 
 ### Activity Log
@@ -84,7 +85,7 @@ The activity drawer records catalog, authentication, claim, and error events. Ne
 
 ### Kill
 
-**Kill** is enabled only while a claim queue or active claim instance is running. It cancels pending queue items, closes extension-created claim tabs, and re-enables Manual Start.
+**Kill** is enabled only while a scan, claim queue, or active claim instance is running. It cancels a scan that is still checking the catalog, cancels pending queue items, closes extension-created claim tabs, and re-enables Manual Start.
 
 ## Claim flow
 
@@ -101,6 +102,8 @@ For a batch claim, the background worker creates a persistent serial queue:
 If you manually open a URL matching a current unclaimed giveaway, the content script can adopt that tab when Auto-claim is enabled. A manually opened page is not adopted while a different serial queue item is active.
 
 ### Reliability safeguards in v3.2.0
+
+- The catalog and library are fetched outside the queue lock, so the popup stays responsive during a scan; the free-games catalog request times out after 15 seconds.
 
 - Ownership is confirmed through Epic's order history when the page does not show it, after each order click, before a claim times out, and when a claim tab is closed.
 - If the order click leaves no ownership signal for 25 seconds, the product page is reloaded once so the observer can see "In Library" (or retry Get).
@@ -144,7 +147,7 @@ Check the selected Store Region and click **Refresh**. Epic promotions are count
 | --- | --- |
 | `storage` | Save settings, catalog cache, claim history, logs, and queue state. |
 | `session` storage | Keep active claim tasks and the serial queue available to the service worker. |
-| `alarms` | Run the once-per-day startup/daily check. |
+| `alarms` | Run the hourly scan, startup retries, the scan after the next promotion change, and the one-minute claim watchdog. |
 | `notifications` | Show a native game-cover notification after a newly confirmed claim. |
 | `tabs` | Open Epic Store pages, follow child checkout tabs, and close extension-created claim tabs. |
 | `cookies` | Check the Epic session and observe login cookie changes. |
@@ -155,15 +158,19 @@ The extension communicates only with Epic Games Store endpoints and the Epic sta
 ## Project structure
 
 ```text
-manifest.json             Extension manifest and permissions
-scripts/background.js     Service worker, storage, catalog, queue, and messages
-scripts/content-epic.js   Epic page observer and safe action clicking
-scripts/core/             Pure state, auth, observation, routing, queue, and library-sync modules
-popup/popup.html           Popup structure and templates
-popup/popup.js             Popup state, cards, modal, and activity log rendering
-popup/popup.css            Popup styling
-tests/core.test.js         Node regression tests for pure modules
-tests/live-brave.mjs       Optional Brave/Playwright smoke harness
+manifest.json                       Extension manifest and permissions
+scripts/background.js               Service worker, storage, catalog, queue, and messages
+scripts/content-epic.js             Epic page observer and safe action clicking
+scripts/core/                       Pure state, auth, observation, routing, queue, and library-sync modules
+popup/popup.html                    Popup structure and templates
+popup/popup.js                      Popup state, cards, modal, and activity log rendering
+popup/popup.css                     Popup styling
+tests/core.test.js                  Node regression tests for pure modules
+tests/content-observer.test.js      Content script against a fake DOM
+tests/pipeline-simulation.test.js   Full service-worker pipeline with mocked chrome/Epic APIs
+tests/live-brave.mjs                Optional Brave/Playwright smoke harness
+AGENTS.md                           Guidance for coding agents
+docs/                               Architecture, claim flow, storage, Epic integration, testing
 ```
 
 ## Development checks
@@ -175,7 +182,9 @@ npm test
 npm run check
 ```
 
-The automated tests cover migration, authentication fallback, safe page observation, zero-cost action gating, claim state transitions, serial queue behavior, child-tab rebinding, and manually opened giveaway URLs.
+See [docs/](docs/) for internals: [architecture](docs/architecture.md), [claim flow](docs/claim-flow.md), [storage](docs/storage.md), [Epic integration](docs/epic-integration.md), and [testing](docs/testing.md).
+
+The automated tests cover migration, authentication fallback, safe page observation, zero-cost action gating, claim state transitions, serial queue behavior, child-tab rebinding, manually opened giveaway URLs, and the full worker pipeline (scheduling, library sync, covers, Kill).
 
 ## Intentional limitations
 
