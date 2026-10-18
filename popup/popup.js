@@ -9,15 +9,34 @@ const THUMBS_KEY = "libraryThumbs";
 // Covers cached once by the background worker as small data URLs.
 let thumbs = {};
 let thumbsVersion = 0;
+// A one-off message (e.g. a scan result) that the poll's "Updated" label must not hide.
+let statusNote = null;
+const STATUS_NOTE_MS = 10_000;
+const POLL_IDLE_MS = 5000;
+const POLL_RUNNING_MS = 1500;
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  // Poll from the start so a slow first answer never leaves the popup frozen.
+  schedulePoll();
   await loadThumbs();
   await loadState();
   // Cheap when everything is cached: the worker only looks up missing covers.
   send({ type: "resolve-thumbnails" });
-  setInterval(() => loadState(), 5000);
 });
+
+// Poll faster while a scan runs so the button and result update promptly.
+function schedulePoll() {
+  setTimeout(async () => {
+    await loadState();
+    schedulePoll();
+  }, state.isClaimRunning ? POLL_RUNNING_MS : POLL_IDLE_MS);
+}
+
+function showNote(message) {
+  statusNote = { text: message, until: Date.now() + STATUS_NOTE_MS };
+  setStatus(message);
+}
 
 function bindEvents() {
   for (const select of document.querySelectorAll("select[data-dropdown]")) enhanceSelect(select);
@@ -75,18 +94,15 @@ function bindEvents() {
 
   // Manual Start button
   $("#run-now")?.addEventListener("click", async () => {
-    const button = $("#run-now");
-    const textSpan = button.querySelector("span");
-    button.disabled = true;
-    if (textSpan) textSpan.textContent = "Running…";
-    setStatus("Running manual auto-claim scan…");
+    state.isClaimRunning = true;
+    state.claimPhase = "checking";
+    render();
+    showNote("Checking for free games…");
 
+    // The scan lives in the background worker, so closing the popup is safe;
+    // the poll picks up the result if this response never arrives.
     const response = await send({ type: "run-claim-now" });
-    if (!response?.ok) {
-      setStatus(response?.error || "Failed to start claim scan.");
-    } else {
-      setStatus(response.summary.message);
-    }
+    showNote(response?.ok ? response.summary.message : response?.error || "Failed to start claim scan.");
     await loadState();
   });
 
@@ -179,7 +195,7 @@ function bindEvents() {
     if (response.ok) {
       state.isClaimRunning = false;
       if (response.sessionLogs) state.sessionLogs = response.sessionLogs;
-      setStatus(response.noInstance ? "No claim instance is running." : "Task terminated by user. Manual Start re-enabled.");
+      showNote(response.noInstance ? "No claim instance is running." : "Task terminated by user. Manual Start re-enabled.");
       render();
     } else {
       setStatus(`Failed to kill task: ${response.error}`);
@@ -235,8 +251,13 @@ async function loadState() {
   }
   loadInFlight = true;
   try {
+    const wasRunning = state.isClaimRunning;
     const response = await send({ type: "get-state" });
-    if (response && response.ok) Object.assign(state, response);
+    if (response && response.ok) {
+      Object.assign(state, response);
+      // Surface the outcome even when the popup was reopened mid-scan.
+      if (wasRunning && !state.isClaimRunning && state.settings?.lastRunMessage) showNote(state.settings.lastRunMessage);
+    }
     render();
   } finally {
     loadInFlight = false;
@@ -310,7 +331,7 @@ function render() {
   if (runNow) {
     if (isClaimRunning) {
       runNow.disabled = true;
-      if (textSpan) textSpan.textContent = "Running…";
+      if (textSpan) textSpan.textContent = state.claimPhase === "checking" ? "Checking…" : "Claiming…";
     } else {
       runNow.disabled = isLoggedOut && !auth.remembered;
       if (textSpan) textSpan.textContent = "Manual Start";
@@ -345,7 +366,8 @@ function render() {
   const errors = [...Object.values(catalog.errors || {}), ...Object.values(state.errors || {})];
   if (auth.status === "unknown" && auth.error) errors.push(auth.error);
   if (state.library?.error) errors.push(`Library sync: ${state.library.error}`);
-  setStatus(errors.length ? `Partial data — ${errors.join(" · ")}` : refreshedLabel(catalog.refreshedAt));
+  if (statusNote && Date.now() < statusNote.until) setStatus(statusNote.text);
+  else setStatus(errors.length ? `Partial data — ${errors.join(" · ")}` : refreshedLabel(catalog.refreshedAt));
 }
 
 function renderGames(platform, games) {

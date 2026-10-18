@@ -51,9 +51,15 @@ const AUTH_CACHE_TTL_MS = 15000;
 const AUTH_CHANGE_DEBOUNCE_MS = 750;
 const NOTIFICATION_COVER_TIMEOUT_MS = 2000;
 const CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
+const CATALOG_FETCH_TIMEOUT_MS = 15_000;
 const MAX_CLICK_FAILURES = 3;
 
 let isClaimRunning = false;
+// A scan refreshes the catalog and library before any queue exists; track it so
+// the popup shows it as running and Kill Instance can cancel it.
+let claimChecksInFlight = 0;
+let claimCheckGeneration = 0;
+let manualRunPromise = null;
 let sessionLogs = [];
 let spawnedClaimTabIds = new Set();
 let authProbePromise = null;
@@ -637,13 +643,14 @@ async function handleMessage(message, sender) {
 async function killInstance() {
   const queue = await getClaimQueue();
   const activeTasks = await getActiveTasks();
-  const hasRunningInstance = isClaimRunning || queue?.status === "running" || activeTasks.length > 0;
+  const hasRunningInstance = isClaimRunning || scanInFlight() || queue?.status === "running" || activeTasks.length > 0;
   if (!hasRunningInstance) {
     return { isClaimRunning: false, noInstance: true, sessionLogs: await getSessionLogs() };
   }
 
   await addLog("Kill Instance triggered by user. Cancelling running tasks...");
   isClaimRunning = false;
+  claimCheckGeneration += 1;
   if (queue?.status === "running") await saveClaimQueue(cancelClaimQueue(queue, Date.now()));
   const claimTabIds = new Set([...spawnedClaimTabIds, ...activeTasks.map((task) => task.tabId).filter(Number.isInteger)]);
   for (const tabId of claimTabIds) {
@@ -887,7 +894,8 @@ async function getState() {
     ...snapshot,
     claimQueue,
     library,
-    isClaimRunning: isClaimRunning || claimQueue?.status === "running" || activeTasks.length > 0,
+    isClaimRunning: isClaimRunning || scanInFlight() || claimQueue?.status === "running" || activeTasks.length > 0,
+    claimPhase: claimQueue?.status === "running" || activeTasks.length > 0 ? "claiming" : scanInFlight() ? "checking" : null,
     accountEmail: authCheck.accountEmail || authCheck.accountLabel || null
   };
 }
@@ -1157,9 +1165,19 @@ async function fetchEpicGames(country) {
   url.searchParams.set("country", country);
   url.searchParams.set("allowCountries", country);
 
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Epic returned HTTP ${response.status}`);
-  const payload = await response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CATALOG_FETCH_TIMEOUT_MS);
+  let payload;
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Epic returned HTTP ${response.status}`);
+    payload = await response.json();
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("Epic free-games API timed out.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
   const elements = payload?.data?.Catalog?.searchStore?.elements || [];
   const now = Date.now();
 
@@ -1295,21 +1313,52 @@ async function runScheduledCheckOnce(reason) {
   }
 }
 
-async function runClaimNow() {
+// Repeat clicks (or a reopened popup) join the scan already in progress.
+function runClaimNow() {
+  if (manualRunPromise) return manualRunPromise;
+  manualRunPromise = runClaimNowOnce().finally(() => { manualRunPromise = null; });
+  return manualRunPromise;
+}
+
+function scanInFlight() {
+  return claimChecksInFlight > 0 || Boolean(manualRunPromise);
+}
+
+async function runClaimNowOnce() {
+  const generation = claimCheckGeneration;
   const authCheck = await checkEpicLoginStatus({ force: true });
   if (authCheck.status === "logged_out" && !authCheck.remembered) {
     await addLog("Manual Start failed: User not logged in to Epic Games Store.");
     throw new Error("Please log in to Epic Games Store on your browser first.");
   }
+  if (generation !== claimCheckGeneration) return { total: 0, queued: 0, skipped: 0, failed: 0, message: "Claim scan cancelled." };
   await addLog("Manual Start initiated by user.");
-  return runClaimBatch({ force: true });
+  return runClaimBatch({ force: true, generation });
 }
 
-function runClaimBatch(options) {
-  return withQueueLock(() => runClaimBatchLocked(options));
+// Network work (catalog refresh, library sync) runs outside the queue lock:
+// holding it there stalled every popup get-state until the scan finished.
+async function runClaimBatch({ generation = claimCheckGeneration, ...options }) {
+  claimChecksInFlight += 1;
+  try {
+    const busy = await withQueueLock(busyClaimSummary);
+    if (busy) return busy;
+    const catalog = await refreshCatalog({ force: options.force });
+    if (catalog.errors?.epic) throw new Error(`Catalog refresh failed: ${catalog.errors.epic}`);
+    // Skip games the account already owns without opening a tab for them.
+    await syncEpicLibrary({ force: options.force, quiet: true }).catch(() => null);
+    if (generation !== claimCheckGeneration) {
+      const message = "Claim scan cancelled.";
+      await addLog(message);
+      return { total: 0, queued: 0, skipped: 0, failed: 0, message };
+    }
+    return await withQueueLock(() => runClaimBatchLocked({ ...options, catalog }));
+  } finally {
+    claimChecksInFlight -= 1;
+  }
 }
 
-async function runClaimBatchLocked({ force = false, automatic = false, quiet = false }) {
+async function busyClaimSummary() {
   const existingQueue = await getClaimQueue();
   if (existingQueue?.status === "running") {
     const message = existingQueue.current
@@ -1325,11 +1374,14 @@ async function runClaimBatchLocked({ force = false, automatic = false, quiet = f
     await addLog(message);
     return { total: activeTasks.length, queued: 0, skipped: 0, failed: 0, message };
   }
-  const catalog = await refreshCatalog({ force });
-  if (catalog.errors?.epic) throw new Error(`Catalog refresh failed: ${catalog.errors.epic}`);
+  return null;
+}
+
+async function runClaimBatchLocked({ automatic = false, quiet = false, catalog }) {
+  // Another scan may have started a queue while this one was fetching.
+  const busy = await busyClaimSummary();
+  if (busy) return busy;
   const games = [...catalog.epic];
-  // Skip games the account already owns without opening a tab for them.
-  await syncEpicLibrary({ force, quiet: true }).catch(() => null);
   const claimed = await getEpicClaimedGames();
   const completedIds = new Set(claimed.filter(isClaimCompleted).map((game) => game.id));
   const unclaimed = games.filter((game) => !completedIds.has(game.id));
