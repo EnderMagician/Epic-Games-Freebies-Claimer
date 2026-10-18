@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const observationApi = require('../scripts/core/epic-observation.js');
+const libraryApi = require('../scripts/core/epic-library.js');
 
 function element(text, attributes = {}, children = []) {
   const node = {
@@ -15,8 +16,9 @@ function element(text, attributes = {}, children = []) {
   return node;
 }
 
-function page({ buttons = [], headings = [], text = '', checkout = false, decision = null } = {}) {
+function page({ buttons = [], headings = [], text = '', checkout = false, decision = null, fetch = null } = {}) {
   const messages = [];
+  const runtimeListeners = [];
   const body = element(text);
   const document = {
     body, documentElement: element(text),
@@ -30,18 +32,27 @@ function page({ buttons = [], headings = [], text = '', checkout = false, decisi
   const url = checkout ? 'https://payment-website-pci.ol.epicgames.com/purchase' : 'https://store.epicgames.com/en-US/p/example';
   const task = { gameId: 'example', url: 'https://store.epicgames.com/en-US/p/example', catalogEligible: true };
   const context = vm.createContext({
-    FreebiesEpicObservation: observationApi, document, window, location: new URL(url), URL, console,
+    FreebiesEpicObservation: observationApi, FreebiesEpicLibrary: libraryApi, fetch, document, window, location: new URL(url), URL, console,
     setTimeout: () => 1, setInterval: () => 1, clearTimeout() {}, clearInterval() {},
     MutationObserver: class { observe() {} disconnect() {} },
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
-    chrome: { runtime: { sendMessage(message, callback) {
-      messages.push(message);
-      callback({ ok: true, task, decision: message.type === 'claim-observation' ? decision : null });
-    } } }
+    chrome: { runtime: {
+      id: 'ext-id',
+      onMessage: { addListener: (fn) => runtimeListeners.push(fn) },
+      sendMessage(message, callback) {
+        messages.push(message);
+        callback({ ok: true, task, decision: message.type === 'claim-observation' ? decision : null });
+      }
+    } }
   });
   vm.runInContext(fs.readFileSync(require.resolve('../scripts/content-epic.js'), 'utf8'), context);
   vm.runInContext(`activeTask = ${JSON.stringify(task)}`, context);
-  return { context, messages, observe: () => context.collectObservation() };
+  const deliver = (message, sender = { id: 'ext-id' }) => new Promise((resolve) => {
+    let async = false;
+    for (const listener of runtimeListeners) async = listener(message, sender, resolve) === true || async;
+    if (!async) setTimeout(() => resolve(undefined), 0);
+  });
+  return { context, messages, deliver, observe: () => context.collectObservation() };
 }
 
 test('content reads Free beside the original price and ignores unrelated page prices', () => {
@@ -115,4 +126,26 @@ test('Place Order dispatch does not report a spurious missing Add to Library act
   assert.equal(results.length, 1);
   assert.equal(results[0].action, 'place_order');
   assert.equal(results[0].success, true);
+});
+
+test('store pages relay only the read-only cover query, and only for this extension', async () => {
+  const requests = [];
+  const fetch = async (url, init) => {
+    requests.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, json: async () => ({ data: { Catalog: { o0: { keyImages: [] } } } }) };
+  };
+  const { deliver } = page({ fetch });
+  const query = libraryApi.catalogOffersQuery([{ id: 'epic-a', offerId: 'abc123', namespace: 'ns456' }]);
+
+  const answered = await deliver({ type: 'freebies-catalog-images', query });
+  assert.equal(answered.ok, true);
+  assert.deepEqual(answered.payload, { data: { Catalog: { o0: { keyImages: [] } } } });
+  assert.equal(requests[0].url, '/graphql');
+
+  const injected = await deliver({ type: 'freebies-catalog-images', query: 'query{Catalog{x: catalogOffer(namespace: "a", id: "b") { price }}}' });
+  assert.equal(injected.ok, false);
+  const mutation = await deliver({ type: 'freebies-catalog-images', query: 'mutation{ addToCart }' });
+  assert.equal(mutation.ok, false);
+  await deliver({ type: 'freebies-catalog-images', query }, { id: 'other-extension' });
+  assert.equal(requests.length, 1, 'rejected and foreign requests never reach Epic');
 });

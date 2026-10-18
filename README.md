@@ -66,7 +66,7 @@ The main popup shows the three newest games. Click the card to open the full Lib
 - Search by title (press `/` to focus, `Esc` to clear, `Esc` again to close).
 - Sort newest, oldest, or A–Z; the list is grouped by month (or by letter) with sticky headers.
 - Filter chips: **All**, **Claimed here** (claimed by this extension), **From account** (imported from Epic order history).
-- Covers are fetched once: imported games are looked up on Epic's public store-content API by title, every cover is downloaded at 112 px (about 2 KB) and stored locally, so reopening the library uses no network. Games without a cover (mostly recent titles) get a coloured monogram and are retried after 30 days.
+- Covers are fetched once. Each game is looked up by its exact namespace/offer id through the store catalog (25 games per request; if Cloudflare blocks the extension's own request, the query is relayed through any open store.epicgames.com tab). Covers are downloaded resized by Epic's CDN, re-encoded in the worker to a 112×68 WebP (about 2 KB; Epic's CDN caches one format per URL, so PNG sources would otherwise stay 13–18 KB) and stored locally, so reopening the library uses no network. Only a definite "Epic has no image" is remembered (retried after 30 days); a failed lookup is retried on the next pass. Records without a catalog id fall back to a title lookup.
 - Rows render in pages of 60 as you scroll. Clicking a row opens its store page, or a store search for imported games.
 - The sync button refreshes ownership from Epic order history.
 

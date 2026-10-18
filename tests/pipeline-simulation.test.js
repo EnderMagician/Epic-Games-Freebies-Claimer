@@ -38,6 +38,7 @@ function createExtensionEnvironment(options = {}) {
     orderHistory = null,
     loginState = null,
     storeContent = {},
+    storeGraphql = null,
     cookies = [
       { name: 'EPIC_BEARER_TOKEN', value: 'fake-token', domain: '.epicgames.com', path: '/' },
       { name: 'EPIC_SSO', value: 'fake-sso', domain: '.epicgames.com', path: '/' }
@@ -195,12 +196,15 @@ function createExtensionEnvironment(options = {}) {
   };
 
   const fetchLog = [];
-  const defaultFetch = async (url) => {
+  const defaultFetch = async (url, init = {}) => {
     const urlStr = String(url);
     fetchLog.push(urlStr);
     if (urlStr.includes('ajaxGetOrderHistory') && orderHistory) {
       const payload = typeof orderHistory === 'function' ? orderHistory(urlStr) : orderHistory;
       return { ok: true, status: 200, json: async () => payload };
+    }
+    if (urlStr === 'https://store.epicgames.com/graphql' && storeGraphql) {
+      return storeGraphql(JSON.parse(init.body).query);
     }
     if (urlStr.includes('/content/products/')) {
       const slug = decodeURIComponent(urlStr.split('/content/products/')[1]);
@@ -1258,6 +1262,70 @@ test('Pipeline Simulation: Library covers are downloaded once, resized, and cach
   assert.equal(env.fetchLog.filter((url) => url.includes('/content/products/') || url.includes('unrealengine')).length,
     env.fetchLog.slice(0, fetchesBefore).filter((url) => url.includes('/content/products/') || url.includes('unrealengine')).length,
     'a second pass fetches nothing');
+});
+
+test('Pipeline Simulation: Covers resolve by exact catalog id, relaying through a store tab when Cloudflare blocks the worker', async () => {
+  const answer = (query) => {
+    const Catalog = {};
+    for (const match of query.matchAll(/(o\d+): catalogOffer\(namespace: "([^"]+)", id: "([^"]+)"/g)) {
+      Catalog[match[1]] = match[3] === 'nocover' ? { keyImages: [] } : { keyImages: [
+        { type: 'OfferImageTall', url: `https://cdn1.epicgames.com/${match[3]}-tall.png` },
+        { type: 'OfferImageWide', url: `https://cdn1.epicgames.com/${match[3]}-wide.png` }
+      ] };
+    }
+    return { data: { Catalog } };
+  };
+  const env = createExtensionEnvironment({
+    initialStorage: {
+      claimedGames: [
+        { id: 'epic-brotato', offerId: 'brotato', namespace: 'ns1', title: 'Brotato', status: 'owned', source: 'epic_account' },
+        { id: 'epic-nocover', offerId: 'nocover', namespace: 'ns2', title: 'Some DLC', status: 'owned', source: 'epic_account' }
+      ]
+    },
+    storeGraphql: async () => ({ ok: false, status: 403, json: async () => { throw new Error('html'); } })
+  });
+
+  // No store tab open: the lookup fails without stamping anything.
+  let summary = await env.context.resolveLibraryThumbnails();
+  assert.match(summary.lookupError, /open any store\.epicgames\.com page/);
+  assert.equal(env.storageLocalStore.claimedGames.some((game) => game.imageCheckedAt), false, 'a failed lookup is retried, not stamped');
+
+  // A store tab relays the same query.
+  const relayed = [];
+  env.chrome.tabs.query = async ({ url } = {}) => (url ? [{ id: 77, url: 'https://store.epicgames.com/en-US/' }] : []);
+  env.chrome.tabs.sendMessage = async (tabId, message) => {
+    relayed.push({ tabId, message });
+    return { ok: true, status: 200, payload: answer(message.query) };
+  };
+  summary = await env.context.resolveLibraryThumbnails();
+  assert.equal(summary.lookupError, null);
+  assert.equal(relayed.length, 1, 'both games go in one batched query');
+  assert.equal(relayed[0].message.type, 'freebies-catalog-images');
+
+  const records = new Map(env.storageLocalStore.claimedGames.map((game) => [game.id, game]));
+  assert.equal(records.get('epic-brotato').image, 'https://cdn1.epicgames.com/brotato-wide.png', 'prefers the wide key image');
+  assert.equal(records.get('epic-brotato').imageSource, 'catalog');
+  assert.ok(records.get('epic-nocover').imageCheckedAt, 'a definite no-cover answer is stamped');
+  assert.match(env.storageLocalStore.libraryThumbs['epic-brotato'], /^data:image\//);
+  assert.equal(env.storageLocalStore.libraryThumbs['epic-nocover'], undefined);
+});
+
+test('Pipeline Simulation: Covers stamped by the old title lookup are retried once with the better lookup', async () => {
+  const lookups = [];
+  const env = createExtensionEnvironment({
+    initialStorage: {
+      claimedGames: [{ id: 'epic-x', offerId: 'x1', namespace: 'nsx', title: 'Brotato', status: 'owned', source: 'epic_account', imageCheckedAt: new Date().toISOString() }]
+    },
+    storeGraphql: async (query) => {
+      lookups.push(query);
+      return { ok: true, status: 200, json: async () => ({ data: { Catalog: { o0: { keyImages: [{ type: 'OfferImageWide', url: 'https://cdn1.epicgames.com/x-wide.png' }] } } } }) };
+    }
+  });
+  await env.context.resolveLibraryThumbnails();
+  assert.equal(lookups.length, 1);
+  assert.ok(env.storageLocalStore.libraryThumbs['epic-x']);
+  await env.context.resolveLibraryThumbnails();
+  assert.equal(lookups.length, 1, 'cached covers are never looked up again');
 });
 
 test('Pipeline Simulation: Slow tab loading with delayed DOM hydration handles multiple wait steps without miss timing', async () => {

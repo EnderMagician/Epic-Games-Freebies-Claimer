@@ -5,6 +5,28 @@ const ACTION_LABELS = {
   place_order: ['place order', 'dat hang', 'confirm order', 'xac nhan dat hang']
 };
 
+// Cover lookups: the store GraphQL sits behind Cloudflare, which a same-origin
+// request from a store page passes. The worker relays only the read-only
+// catalog-offer image query here, and only this extension may ask.
+if (window.top === window && location.hostname === 'store.epicgames.com') {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (sender.id !== chrome.runtime.id || message?.type !== 'freebies-catalog-images') return false;
+    if (!FreebiesEpicLibrary.isCatalogOffersQuery(message.query)) {
+      sendResponse({ ok: false, error: 'Rejected an unexpected catalog query.' });
+      return false;
+    }
+    fetch('/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ query: message.query })
+    })
+      .then(async (response) => sendResponse({ ok: response.ok, status: response.status, payload: await response.json().catch(() => null) }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+    return true;
+  });
+}
+
 let activeTask = null;
 let observationInFlight = false;
 let stopped = false;

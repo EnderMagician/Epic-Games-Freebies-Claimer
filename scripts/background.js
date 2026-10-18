@@ -6,7 +6,8 @@ const { fetchLoginState: fetchEpicLoginState } = FreebiesAuthClient;
 const { createClaimTask, reduceClaimTask } = FreebiesClaimMachine;
 const { findClaimableGameForUrl } = FreebiesClaimRouting;
 const { createClaimQueue, beginNextClaim, rebindCurrentClaim, finishCurrentClaim, skipNextClaim, cancelClaimQueue } = FreebiesClaimQueue;
-const { orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed, STORE_CONTENT_URL, thumbnailSlugCandidates, extractStoreContentImage, thumbnailUrl } = FreebiesEpicLibrary;
+const { orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed, STORE_CONTENT_URL, thumbnailSlugCandidates, extractStoreContentImage, thumbnailUrl,
+  STORE_GRAPHQL_URL, CATALOG_BATCH_SIZE, hasCatalogKey, catalogOffersQuery, parseCatalogOffers } = FreebiesEpicLibrary;
 
 const CATALOG_KEY = "catalog";
 const CLAIMED_KEY = "claimedGames";
@@ -21,6 +22,11 @@ const LIBRARY_KEY = "epicLibrary";
 // Kept apart from claimedGames so the 5-second popup poll never carries image bytes.
 const THUMBS_KEY = "libraryThumbs";
 const THUMBNAIL_MAX_BYTES = 12_000;
+// Bump when the lookup gets better so earlier "no cover" stamps are retried.
+const THUMBNAIL_LOOKUP_VERSION = 2;
+const THUMBS_FORMAT_KEY = "libraryThumbsFormat";
+const THUMBNAIL_FORMAT_VERSION = 2;
+const THUMBNAIL_PIXELS = { width: 112, height: 68 };
 const SCHEDULE_STATE_KEY = "scheduleState";
 const ALARM_NAME = "freebies-daily-check";
 const CLAIM_WATCHDOG_ALARM = "freebies-claim-watchdog";
@@ -134,6 +140,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   await ensureAlarms();
   await refreshCatalog({ force: true });
   await runScheduledCheck("install");
+  void resolveLibraryThumbnails().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -1278,6 +1285,8 @@ async function runScheduledCheckOnce(reason) {
   try {
     const summary = await runClaimBatch({ force: reason === "new-drop", automatic: true, quiet: reason === "periodic" });
     await updateSettingsInternal({ lastDailyRun: localDayKey() });
+    // Covers fill in without the popup; this is a no-op once all are cached.
+    void resolveLibraryThumbnails().catch(() => {});
     return summary;
   } catch (error) {
     await saveScheduleState({ pendingCheck: true });
@@ -1559,7 +1568,7 @@ function fetchNotificationImageDataUrl(imageUrl) {
   return fetchImageDataUrl(imageUrl, NOTIFICATION_COVER_TIMEOUT_MS);
 }
 
-async function fetchImageDataUrl(imageUrl, timeoutMs) {
+async function fetchImageDataUrl(imageUrl, timeoutMs, { accept = null } = {}) {
   const url = new URL(imageUrl);
   if (url.protocol === "data:" || url.protocol === "blob:") return url.toString();
   if (url.protocol !== "https:") throw new Error("Game cover must use HTTPS.");
@@ -1570,6 +1579,7 @@ async function fetchImageDataUrl(imageUrl, timeoutMs) {
     const response = await fetch(url.toString(), {
       credentials: "omit",
       cache: "force-cache",
+      ...(accept ? { headers: { Accept: accept } } : {}),
       signal: controller.signal
     });
     if (!response.ok) throw new Error(`Game cover returned HTTP ${response.status}.`);
@@ -1681,14 +1691,19 @@ function resolveLibraryThumbnails() {
   return thumbnailPromise;
 }
 
-// Each cover is looked up and downloaded once, as a ~2 KB data URL kept under
-// its own storage key; the library then renders without touching the network.
-// A game with no cover is stamped and retried only after 30 days.
+// Each cover is looked up and downloaded once, as a ~1 KB WebP data URL kept
+// under its own storage key; the library then renders without the network.
+// Lookups go by exact namespace/offer id through the store catalog (batched),
+// falling back to the title-based store-content API for records without one.
+// Only a definite "Epic has no image" is stamped (retried after 30 days); a
+// failed lookup leaves the game unstamped so the next pass tries again.
 async function resolveLibraryThumbnailsOnce() {
+  await reencodeCachedThumbnails().catch(() => 0);
   const now = Date.now();
   const thumbs = (await chrome.storage.local.get(THUMBS_KEY).catch(() => ({})))[THUMBS_KEY] || {};
   const pending = (await getEpicClaimedGames()).filter((game) => isClaimCompleted(game) && !thumbs[game.id]
-    && (game.image || now - (Date.parse(game.imageCheckedAt || "") || 0) >= THUMBNAIL_RETRY_MS));
+    && (game.image || (game.imageLookupVersion || 1) < THUMBNAIL_LOOKUP_VERSION
+      || now - (Date.parse(game.imageCheckedAt || "") || 0) >= THUMBNAIL_RETRY_MS));
   if (!pending.length) return { found: 0, checked: 0 };
 
   const recordUpdates = new Map();
@@ -1704,35 +1719,173 @@ async function resolveLibraryThumbnailsOnce() {
     const claimed = (await getEpicClaimedGames()).map((game) => records.has(game.id) ? { ...game, ...records.get(game.id) } : game);
     await chrome.storage.local.set({ [CLAIMED_KEY]: claimed, [THUMBS_KEY]: { ...(stored[THUMBS_KEY] || {}), ...images } });
   };
+  const stampMiss = (game) => recordUpdates.set(game.id, { imageCheckedAt: new Date().toISOString(), imageLookupVersion: THUMBNAIL_LOOKUP_VERSION });
 
-  let found = 0;
+  // 1. Resolve cover URLs. Games that already have one skip the lookup.
+  const urls = new Map(pending.filter((game) => game.image).map((game) => [game.id, game.image]));
+  const unresolved = pending.filter((game) => !game.image);
+  const byCatalog = unresolved.filter(hasCatalogKey);
+  const byTitle = unresolved.filter((game) => !hasCatalogKey(game));
+  let lookupError = null;
+  for (let index = 0; index < byCatalog.length; index += CATALOG_BATCH_SIZE) {
+    const batch = byCatalog.slice(index, index + CATALOG_BATCH_SIZE);
+    try {
+      const results = await fetchCatalogOfferImages(batch);
+      for (const game of batch) {
+        const url = results.get(game.id);
+        if (url) urls.set(game.id, url);
+        else stampMiss(game);
+      }
+    } catch (error) {
+      lookupError = readableError(error);
+      break;
+    }
+  }
   let cursor = 0;
-  const worker = async () => {
-    while (cursor < pending.length) {
-      const game = pending[cursor++];
-      const checkedAt = new Date().toISOString();
-      const image = game.image || await fetchStoreContentThumbnail(game.title).catch(() => null);
-      const dataUrl = image ? await fetchThumbnailDataUrl(image).catch(() => null) : null;
+  const titleWorker = async () => {
+    while (cursor < byTitle.length) {
+      const game = byTitle[cursor++];
+      const url = await fetchStoreContentThumbnail(game.title).catch(() => null);
+      if (url) urls.set(game.id, url);
+      else stampMiss(game);
+    }
+  };
+  await Promise.all(Array.from({ length: THUMBNAIL_CONCURRENCY }, titleWorker));
+
+  // 2. Download each resolved cover once, small.
+  const toDownload = pending.filter((game) => urls.has(game.id));
+  let found = 0;
+  let downloadFailures = 0;
+  cursor = 0;
+  const downloadWorker = async () => {
+    while (cursor < toDownload.length) {
+      const game = toDownload[cursor++];
+      const url = urls.get(game.id);
+      const dataUrl = await fetchThumbnailDataUrl(url).catch(() => null);
+      const update = { imageLookupVersion: THUMBNAIL_LOOKUP_VERSION };
+      if (!game.image) Object.assign(update, { image: url, imageSource: hasCatalogKey(game) ? "catalog" : "store-content" });
       if (dataUrl) {
         found += 1;
         thumbUpdates.set(game.id, dataUrl);
+        update.imageCheckedAt = new Date().toISOString();
+      } else {
+        // Keep the URL so the popup can still load it lazily; retry the download later.
+        downloadFailures += 1;
       }
-      recordUpdates.set(game.id, image && !game.image
-        ? { image, imageSource: "store-content", imageCheckedAt: checkedAt }
-        : { imageCheckedAt: checkedAt });
-      if (recordUpdates.size >= 20) await flush();
+      recordUpdates.set(game.id, update);
+      if (recordUpdates.size >= 25) await flush();
     }
   };
-  await Promise.all(Array.from({ length: THUMBNAIL_CONCURRENCY }, worker));
+  await Promise.all(Array.from({ length: THUMBNAIL_CONCURRENCY }, downloadWorker));
   await flush();
-  await addLog(`Library covers: saved ${found} of ${pending.length} missing cover(s).`);
-  return { found, checked: pending.length };
+
+  const misses = pending.length - toDownload.length - (lookupError ? byCatalog.filter((game) => !urls.has(game.id) && !recordUpdates.has(game.id)).length : 0);
+  const parts = [`saved ${found} of ${pending.length} missing cover(s)`];
+  if (misses > 0) parts.push(`${misses} have no cover on Epic`);
+  if (downloadFailures) parts.push(`${downloadFailures} download(s) failed`);
+  if (lookupError) parts.push(`catalog lookup unavailable (${lookupError}); will retry`);
+  await addLog(`Library covers: ${parts.join(", ")}.`);
+  return { found, checked: pending.length, lookupError };
+}
+
+// The store GraphQL is behind Cloudflare. Try it from the worker first; if
+// that is blocked, relay the same read-only query through an open store tab.
+async function fetchCatalogOfferImages(games) {
+  const query = catalogOffersQuery(games);
+  let directError;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(STORE_GRAPHQL_URL, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ query }),
+        signal: controller.signal
+      });
+      const payload = await response.json().catch(() => null);
+      if (response.ok && payload) return parseCatalogOffers(payload, games);
+      directError = `HTTP ${response.status}${payload ? "" : " (not JSON; likely Cloudflare)"}`;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    directError = readableError(error);
+  }
+
+  const tabs = await chrome.tabs.query({ url: "https://store.epicgames.com/*" }).catch(() => []);
+  for (const tab of tabs) {
+    const response = await chrome.tabs.sendMessage(tab.id, { type: "freebies-catalog-images", query }, { frameId: 0 }).catch(() => null);
+    if (response?.ok && response.payload) return parseCatalogOffers(response.payload, games);
+  }
+  throw new Error(tabs.length
+    ? `direct ${directError}; store tab relay failed`
+    : `direct ${directError}; open any store.epicgames.com page to relay`);
 }
 
 async function fetchThumbnailDataUrl(imageUrl) {
-  const dataUrl = await fetchImageDataUrl(thumbnailUrl(imageUrl), 8000);
-  // Skip CDNs that ignored the resize request; the popup can still load the URL lazily.
-  return dataUrl.length <= THUMBNAIL_MAX_BYTES * 4 / 3 + 64 ? dataUrl : null;
+  // Ask the CDN for a small copy, then re-encode it here: Epic's CDN caches one
+  // format per URL (no Vary: Accept), so a PNG source can come back as a 13+ KB PNG.
+  const dataUrl = await fetchImageDataUrl(thumbnailUrl(imageUrl), 8000, { accept: "image/webp,image/*;q=0.8" });
+  const encoded = await encodeThumbnail(dataUrl).catch(() => dataUrl);
+  return encoded.length <= THUMBNAIL_MAX_BYTES * 4 / 3 + 64 ? encoded : null;
+}
+
+// Center-crop to the library slot (56x34 CSS px at 2x) and encode as WebP,
+// about 1 KB per cover. Without OffscreenCanvas the input is returned as is.
+async function encodeThumbnail(dataUrl) {
+  if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap === "undefined") return dataUrl;
+  const blob = await (await fetch(dataUrl)).blob();
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = new OffscreenCanvas(THUMBNAIL_PIXELS.width, THUMBNAIL_PIXELS.height);
+    const context = canvas.getContext("2d");
+    const scale = Math.max(canvas.width / bitmap.width, canvas.height / bitmap.height);
+    const width = bitmap.width * scale;
+    const height = bitmap.height * scale;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(bitmap, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+    let output = await canvas.convertToBlob({ type: "image/webp", quality: 0.35 });
+    if (output.type !== "image/webp") output = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.5 });
+    const encoded = await blobToDataUrl(output);
+    // Keep the source when it is already smaller (tiny or flat images).
+    return encoded.length < dataUrl.length ? encoded : dataUrl;
+  } finally {
+    bitmap.close?.();
+  }
+}
+
+async function blobToDataUrl(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
+}
+
+// One-time local pass: re-encode covers cached before WebP encoding existed.
+// Works purely on stored data URLs, so it costs no network.
+async function reencodeCachedThumbnails() {
+  if (typeof OffscreenCanvas === "undefined") return 0;
+  const stored = await chrome.storage.local.get([THUMBS_KEY, THUMBS_FORMAT_KEY]).catch(() => ({}));
+  if (stored[THUMBS_FORMAT_KEY] >= THUMBNAIL_FORMAT_VERSION) return 0;
+  const thumbs = stored[THUMBS_KEY] || {};
+  const updates = {};
+  for (const [id, dataUrl] of Object.entries(thumbs)) {
+    if (dataUrl.startsWith("data:image/webp")) continue;
+    const encoded = await encodeThumbnail(dataUrl).catch(() => null);
+    if (encoded && encoded !== dataUrl) updates[id] = encoded;
+  }
+  const latest = (await chrome.storage.local.get(THUMBS_KEY).catch(() => ({})))[THUMBS_KEY] || {};
+  await chrome.storage.local.set({ [THUMBS_KEY]: { ...latest, ...updates }, [THUMBS_FORMAT_KEY]: THUMBNAIL_FORMAT_VERSION });
+  const before = Object.keys(updates).reduce((sum, id) => sum + thumbs[id].length, 0);
+  const after = Object.values(updates).reduce((sum, value) => sum + value.length, 0);
+  if (Object.keys(updates).length) {
+    await addLog(`Library covers: re-encoded ${Object.keys(updates).length} cached cover(s) as WebP (${Math.round(before / 1024)} KB → ${Math.round(after / 1024)} KB).`);
+  }
+  return Object.keys(updates).length;
 }
 
 async function fetchStoreContentThumbnail(title) {

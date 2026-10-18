@@ -173,7 +173,57 @@
     }
   }
 
+  // Exact cover lookup: Epic's store GraphQL resolves an offer by namespace and
+  // id, which order-history items carry. Aliases batch many offers per request.
+  const STORE_GRAPHQL_URL = 'https://store.epicgames.com/graphql';
+  const CATALOG_BATCH_SIZE = 25;
+  const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+  const KEY_IMAGE_PREFERENCE = ['OfferImageWide', 'DieselStoreFrontWide', 'DieselGameBoxWide', 'featuredMedia',
+    'Thumbnail', 'DieselStoreFrontTall', 'OfferImageTall', 'DieselGameBoxTall', 'DieselGameBox'];
+
+  function hasCatalogKey(game) {
+    return SAFE_ID.test(String(game?.namespace || '')) && SAFE_ID.test(String(catalogOfferId(game) || ''));
+  }
+
+  function catalogOffersQuery(games) {
+    const fields = games.filter(hasCatalogKey).map((game, index) =>
+      `o${index}: catalogOffer(namespace: "${game.namespace}", id: "${catalogOfferId(game)}", locale: "en-US") { keyImages { type url } }`);
+    return `query{Catalog{${fields.join(' ')}}}`;
+  }
+
+  function isCatalogOffersQuery(query) {
+    return typeof query === 'string' && query.length <= 12000
+      && /^query\{Catalog\{(?:o\d+: catalogOffer\(namespace: "[A-Za-z0-9_-]+", id: "[A-Za-z0-9_-]+", locale: "en-US"\) \{ keyImages \{ type url \} \} ?)+\}\}$/.test(query);
+  }
+
+  function pickKeyImage(keyImages) {
+    const images = (Array.isArray(keyImages) ? keyImages : [])
+      .filter((image) => typeof image?.url === 'string' && /^https:\/\//.test(image.url));
+    for (const type of KEY_IMAGE_PREFERENCE) {
+      const match = images.find((image) => image.type === type);
+      if (match) return match.url;
+    }
+    return images[0]?.url || null;
+  }
+
+  // Returns id -> image URL, or null when Epic answered but has no image.
+  // Throws when the response is not a usable GraphQL answer, so the caller can
+  // tell "no cover" apart from "lookup failed" and retry the latter soon.
+  function parseCatalogOffers(payload, games) {
+    const catalog = payload?.data?.Catalog;
+    if (!catalog || typeof catalog !== 'object') {
+      const message = payload?.errors?.[0]?.message;
+      throw new Error(message ? `Epic catalog lookup failed: ${message}` : 'Epic catalog lookup returned no data.');
+    }
+    const results = new Map();
+    games.filter(hasCatalogKey).forEach((game, index) => {
+      results.set(game.id, pickKeyImage(catalog[`o${index}`]?.keyImages));
+    });
+    return results;
+  }
+
   return {
+    STORE_GRAPHQL_URL, CATALOG_BATCH_SIZE, hasCatalogKey, catalogOffersQuery, isCatalogOffersQuery, pickKeyImage, parseCatalogOffers,
     THUMBNAIL_WIDTH, thumbnailUrl,
     ORDER_HISTORY_URL, STORE_CONTENT_URL, orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed,
     normalizeTitle, titleSlug, thumbnailSlugCandidates, extractStoreContentImage
