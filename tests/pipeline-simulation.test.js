@@ -35,6 +35,8 @@ function createExtensionEnvironment(options = {}) {
   const {
     initialStorage = {},
     customFetch,
+    orderHistory = null,
+    loginState = null,
     cookies = [
       { name: 'EPIC_BEARER_TOKEN', value: 'fake-token', domain: '.epicgames.com', path: '/' },
       { name: 'EPIC_SSO', value: 'fake-sso', domain: '.epicgames.com', path: '/' }
@@ -166,6 +168,7 @@ function createExtensionEnvironment(options = {}) {
     },
     alarms: {
       create: (name, info) => alarms.set(name, info),
+      get: async (name) => (alarms.has(name) ? { name, ...alarms.get(name) } : undefined),
       clear: (name) => alarms.delete(name),
       onAlarm: { addListener: (fn) => alarmListeners.push(fn) }
     },
@@ -190,8 +193,18 @@ function createExtensionEnvironment(options = {}) {
     }
   };
 
+  const fetchLog = [];
   const defaultFetch = async (url) => {
     const urlStr = String(url);
+    fetchLog.push(urlStr);
+    if (urlStr.includes('ajaxGetOrderHistory') && orderHistory) {
+      const payload = typeof orderHistory === 'function' ? orderHistory(urlStr) : orderHistory;
+      return { ok: true, status: 200, json: async () => payload };
+    }
+    if (urlStr.includes('/id/api/login/state') && loginState) {
+      const payload = typeof loginState === 'function' ? loginState() : loginState;
+      return { ok: true, status: 200, json: async () => payload };
+    }
     if (urlStr.includes('freeGamesPromotions')) {
       return {
         ok: true,
@@ -306,6 +319,12 @@ function createExtensionEnvironment(options = {}) {
     }
   }
 
+  async function triggerCookieChange(cookie) {
+    for (const fn of cookieListeners) {
+      await fn({ cookie });
+    }
+  }
+
   async function triggerStartup() {
     for (const fn of startupListeners) {
       await fn();
@@ -324,10 +343,12 @@ function createExtensionEnvironment(options = {}) {
     tabs,
     alarms,
     notifications,
+    fetchLog,
     sendMessage,
     triggerAlarm,
     triggerInstalled,
     triggerStartup,
+    triggerCookieChange,
     closeTab
   };
 }
@@ -975,7 +996,11 @@ test('Pipeline Simulation: Auth probe retains logged_in via cookie fallback duri
   assert.equal(authState.source, 'cookie_fallback');
 });
 
-test('Pipeline Simulation: Daily check alarm skips claim batch if already run today', async () => {
+function orderFor(offerId, title, createdAtMillis = Date.now()) {
+  return { orderId: `order-${offerId}`, createdAtMillis, items: [{ offerId, namespace: `ns-${offerId}`, description: title }] };
+}
+
+test('Pipeline Simulation: Scheduled check still claims after an earlier run the same day', async () => {
   const now = new Date();
   const offset = now.getTimezoneOffset() * 60_000;
   const today = new Date(now.getTime() - offset).toISOString().slice(0, 10);
@@ -993,8 +1018,194 @@ test('Pipeline Simulation: Daily check alarm skips claim batch if already run to
   await env.triggerAlarm('freebies-daily-check');
 
   const state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.isClaimRunning, true);
+  assert.equal(state.claimQueue.current.title, 'Game Alpha');
+});
+
+test('Pipeline Simulation: Startup defers a logged-out answer and runs once Epic reports a login', async () => {
+  let loggedIn = false;
+  const env = createExtensionEnvironment({
+    cookies: [],
+    loginState: () => ({ isLoggedIn: loggedIn })
+  });
+
+  await env.triggerStartup();
+  let state = await env.sendMessage({ type: 'get-state' });
   assert.equal(state.isClaimRunning, false);
-  assert.ok(state.sessionLogs.some((l) => l.includes('Already executed once today')));
+  assert.ok(env.alarms.has('freebies-startup-retry'), 'a retry alarm is scheduled');
+  assert.ok(state.sessionLogs.some((l) => l.includes('Scheduled check deferred')));
+
+  loggedIn = true;
+  await env.triggerCookieChange({ name: 'EPIC_EG1', domain: '.epicgames.com' });
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  await env.context.scheduledCheckPromise;
+
+  state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.isClaimRunning, true);
+  assert.equal(state.claimQueue.current.title, 'Game Alpha');
+});
+
+test('Pipeline Simulation: Cached catalog expires at the next promotion boundary', async () => {
+  const env = createExtensionEnvironment();
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  const catalog = env.storageLocalStore.catalog;
+  assert.ok(catalog.validUntil, 'catalog records when it goes stale');
+  assert.ok(env.alarms.has('freebies-next-drop'), 'an alarm is set for the next promotion boundary');
+
+  const fetchesBefore = env.fetchLog.filter((u) => u.includes('freeGamesPromotions')).length;
+  await env.sendMessage({ type: 'refresh-catalog', force: false });
+  assert.equal(env.fetchLog.filter((u) => u.includes('freeGamesPromotions')).length, fetchesBefore, 'fresh cache is reused');
+
+  env.storageLocalStore.catalog = { ...catalog, validUntil: new Date(Date.now() - 1000).toISOString() };
+  await env.sendMessage({ type: 'refresh-catalog', force: false });
+  assert.equal(env.fetchLog.filter((u) => u.includes('freeGamesPromotions')).length, fetchesBefore + 1, 'stale cache refetches');
+});
+
+test('Pipeline Simulation: Library sync skips games the account already owns and imports the rest', async () => {
+  const env = createExtensionEnvironment({
+    orderHistory: { orders: [orderFor('promo-1', 'Game Alpha'), orderFor('old-1', 'Older Freebie', 1_600_000_000_000)] }
+  });
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  const run = await env.sendMessage({ type: 'run-claim-now' });
+  assert.equal(run.summary.queued, 1);
+
+  const state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.claimQueue.current.title, 'Game Beta');
+  const alpha = state.claimedGames.find((g) => g.id === 'epic-promo-1');
+  assert.equal(alpha.status, 'owned');
+  assert.ok(state.claimedGames.some((g) => g.title === 'Older Freebie' && g.status === 'owned'));
+  assert.equal(state.library.itemCount, 2);
+  assert.equal(state.library.error, null);
+});
+
+test('Pipeline Simulation: Library sync failure is reported without blocking the claim', async () => {
+  const env = createExtensionEnvironment({ orderHistory: '<html>login</html>' });
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  const run = await env.sendMessage({ type: 'run-claim-now' });
+  assert.equal(run.summary.queued, 2);
+  const state = await env.sendMessage({ type: 'get-state' });
+  assert.match(state.library.error, /unexpected response/);
+});
+
+test('Pipeline Simulation: Order history confirms a claim the page never showed as owned', async () => {
+  let orders = [];
+  const env = createExtensionEnvironment({ orderHistory: () => ({ orders }) });
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  await env.sendMessage({ type: 'run-claim-now' });
+  let state = await env.sendMessage({ type: 'get-state' });
+  const tabId = state.claimQueue.current.tabId;
+  const sender = { tab: { id: tabId }, frameId: 0 };
+
+  const get = await env.sendMessage({ type: 'claim-observation', observation: { visibleActions: ['get'], freeEvidence: 'confirmed', blockers: [] } }, sender);
+  assert.equal(get.decision.action, 'click_get');
+
+  orders = [orderFor('promo-1', 'Game Alpha')];
+  const task = env.storageSessionStore.activeClaimTasks[String(tabId)];
+  task.lastOwnershipCheckAt = 0;
+  const after = await env.sendMessage({ type: 'claim-observation', observation: { visibleActions: [], freeEvidence: 'unknown', blockers: [] } }, sender);
+  assert.equal(after.decision.action, 'complete_owned');
+  assert.equal(env.tabs.has(tabId), false);
+
+  state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.claimQueue.results[0].status, 'owned');
+  assert.equal(state.claimQueue.current.title, 'Game Beta');
+});
+
+test('Pipeline Simulation: A stalled order click reloads the product page once', async () => {
+  const env = createExtensionEnvironment({ orderHistory: { orders: [] } });
+  let reloads = 0;
+  env.chrome.tabs.reload = async () => { reloads += 1; };
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  await env.sendMessage({ type: 'run-claim-now' });
+  const state = await env.sendMessage({ type: 'get-state' });
+  const tabId = state.claimQueue.current.tabId;
+  const key = String(tabId);
+  env.storageSessionStore.activeClaimTasks[key] = {
+    ...env.storageSessionStore.activeClaimTasks[key],
+    phase: 'confirmation_clicked',
+    attempts: 2,
+    confirmClicks: 1,
+    lastActionAt: Date.now() - 30_000
+  };
+
+  const result = await env.sendMessage({ type: 'claim-observation', observation: { context: 'product', visibleActions: [], offerEvidence: 'unknown', checkoutTotalEvidence: 'unknown', blockers: [] } }, { tab: { id: tabId }, frameId: 0 });
+  assert.equal(result.decision.action, 'wait');
+  assert.match(result.decision.reason, /reloading/);
+  assert.equal(reloads, 1);
+  assert.equal(env.storageSessionStore.activeClaimTasks[key].phase, 'waiting_for_get');
+
+  env.storageSessionStore.activeClaimTasks[key].lastOwnershipCheckAt = 0;
+  env.storageSessionStore.activeClaimTasks[key].phase = 'confirmation_clicked';
+  await env.sendMessage({ type: 'claim-observation', observation: { context: 'product', visibleActions: [], offerEvidence: 'unknown', checkoutTotalEvidence: 'unknown', blockers: [] } }, { tab: { id: tabId }, frameId: 0 });
+  assert.equal(reloads, 1, 'the reload fallback runs only once');
+});
+
+test('Pipeline Simulation: Closing a claim tab after a successful order records it as owned', async () => {
+  let orders = [];
+  const env = createExtensionEnvironment({ orderHistory: () => ({ orders }) });
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  await env.sendMessage({ type: 'run-claim-now' });
+  let state = await env.sendMessage({ type: 'get-state' });
+  const tabId = state.claimQueue.current.tabId;
+  await env.sendMessage({ type: 'claim-observation', observation: { visibleActions: ['get'], freeEvidence: 'confirmed', blockers: [] } }, { tab: { id: tabId }, frameId: 0 });
+
+  orders = [orderFor('promo-1', 'Game Alpha')];
+  await env.closeTab(tabId);
+  state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.claimQueue.results[0].status, 'owned');
+  assert.equal(state.claimedGames.find((g) => g.id === 'epic-promo-1').status, 'owned');
+});
+
+test('Pipeline Simulation: Unattended scans back off from a game that just failed', async () => {
+  const env = createExtensionEnvironment({
+    initialStorage: {
+      claimedGames: [{ id: 'epic-promo-1', platform: 'epic', title: 'Game Alpha', status: 'failed', claimedAt: new Date().toISOString() }]
+    }
+  });
+  await env.triggerAlarm('freebies-daily-check');
+  const state = await env.sendMessage({ type: 'get-state' });
+  assert.equal(state.claimQueue.pending.length, 0);
+  assert.equal(state.claimQueue.current.title, 'Game Beta');
+});
+
+test('Pipeline Simulation: Expired Epic session picks the lone remembered account and resumes the claim', async () => {
+  const env = createExtensionEnvironment();
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  await env.sendMessage({ type: 'run-claim-now' });
+  const state = await env.sendMessage({ type: 'get-state' });
+  const tabId = state.claimQueue.current.tabId;
+  const sender = { tab: { id: tabId }, frameId: 0, url: 'https://www.epicgames.com/id/login/switch-account?lang=en-US' };
+  await env.sendMessage({ type: 'claim-observation', observation: { visibleActions: ['get'], freeEvidence: 'confirmed', blockers: [] } }, { tab: { id: tabId }, frameId: 0 });
+
+  const pickerObservation = { context: 'unknown', visibleActions: [], offerEvidence: 'unknown', checkoutTotalEvidence: 'unknown', blockers: ['login'], accountPicker: { state: 'single', count: 1, labels: [] } };
+  const pick = await env.sendMessage({ type: 'claim-observation', observation: pickerObservation }, sender);
+  assert.equal(pick.decision.action, 'click_account');
+  const key = String(tabId);
+  assert.equal(env.storageSessionStore.activeClaimTasks[key].pendingAction.kind, 'click_account');
+
+  await env.sendMessage({ type: 'claim-action-result', action: 'pick_account', success: true, detail: 'Selected the remembered Epic account.' }, sender);
+  assert.equal(env.storageSessionStore.activeClaimTasks[key].pendingAction, null);
+
+  const again = await env.sendMessage({ type: 'claim-observation', observation: pickerObservation }, sender);
+  assert.equal(again.decision.action, 'wait', 'no second click while Epic is still signing in');
+
+  // Back on the product page with the purchase intent, the claim continues.
+  const owned = await env.sendMessage({ type: 'claim-observation', observation: { visibleActions: [], ownershipVisible: true, freeEvidence: 'unknown', blockers: [] } }, { tab: { id: tabId }, frameId: 0 });
+  assert.equal(owned.decision.action, 'complete_owned');
+});
+
+test('Pipeline Simulation: A password prompt on Epic sign-in pauses the claim instead of clicking', async () => {
+  const env = createExtensionEnvironment();
+  await env.sendMessage({ type: 'refresh-catalog', force: true });
+  await env.sendMessage({ type: 'run-claim-now' });
+  const state = await env.sendMessage({ type: 'get-state' });
+  const tabId = state.claimQueue.current.tabId;
+  const sender = { tab: { id: tabId }, frameId: 0, url: 'https://www.epicgames.com/id/login?lang=en-US' };
+  const result = await env.sendMessage({ type: 'claim-observation', observation: { context: 'unknown', visibleActions: [], blockers: ['login'], accountPicker: { state: 'password', count: 0, labels: [] } } }, sender);
+  assert.equal(result.decision.action, 'needs_attention');
+  assert.match(result.decision.reason, /password/);
+  const after = await env.sendMessage({ type: 'get-state' });
+  assert.equal(after.claimedGames.find((g) => g.id === 'epic-promo-1').status, 'needs_attention');
 });
 
 test('Pipeline Simulation: Slow tab loading with delayed DOM hydration handles multiple wait steps without miss timing', async () => {

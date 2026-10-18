@@ -2,6 +2,9 @@ const $ = (selector) => document.querySelector(selector);
 const state = { settings: null, catalog: null, claimedGames: [], auth: null, isClaimRunning: false, sessionLogs: [], errors: {} };
 let loadInFlight = false;
 let loadQueued = false;
+const LIBRARY_PAGE_SIZE = 60;
+const RECENT_DAYS = 14;
+const library = { query: "", filter: "all", sort: "newest", limit: LIBRARY_PAGE_SIZE, dataKey: "", viewKey: "", observer: null };
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -16,12 +19,17 @@ function bindEvents() {
     btn.classList.add("refreshing");
     setStatus("Refreshing catalog…");
     const response = await send({ type: "refresh-catalog", force: true });
+    if (!response.ok) {
+      btn.classList.remove("refreshing");
+      setStatus(`Failed to refresh: ${response.error}`);
+      return;
+    }
+    state.catalog = response.catalog;
+    setStatus("Syncing Epic library…");
+    const synced = await send({ type: "sync-library" });
     btn.classList.remove("refreshing");
-    if (response.ok) {
-      state.catalog = response.catalog;
-      render();
-      setStatus("Catalog updated successfully.");
-    } else setStatus(`Failed to refresh: ${response.error}`);
+    await loadState();
+    if (synced.ok && !synced.library?.error) setStatus(`Catalog and library updated (${synced.library.itemCount} owned item(s)).`);
   });
 
   // Epic Games Logo click -> Open Store
@@ -85,9 +93,15 @@ function bindEvents() {
 
   $("#log-toggle-btn")?.addEventListener("click", toggleSheet);
 
-  const closeClaimedLibrary = () => $("#claimed-library-modal")?.classList.add("hidden");
+  const closeClaimedLibrary = () => {
+    $("#claimed-library-modal")?.classList.add("hidden");
+    $("#claimed-library-preview")?.focus();
+  };
   const openClaimedLibrary = () => {
-    if (newestClaimedGames(state.claimedGames).length > 0) $("#claimed-library-modal")?.classList.remove("hidden");
+    if (newestClaimedGames(state.claimedGames).length === 0) return;
+    $("#claimed-library-modal")?.classList.remove("hidden");
+    renderLibrary(true);
+    $("#lib-search")?.focus();
   };
   $("#claimed-library-preview")?.addEventListener("click", openClaimedLibrary);
   $("#claimed-library-preview")?.addEventListener("keydown", (event) => {
@@ -98,7 +112,52 @@ function bindEvents() {
   });
   $("#close-claimed-library")?.addEventListener("click", closeClaimedLibrary);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeClaimedLibrary();
+    const open = !$("#claimed-library-modal")?.classList.contains("hidden");
+    if (!open) return;
+    const search = $("#lib-search");
+    if (event.key === "Escape") {
+      event.preventDefault();
+      // First Escape clears an active search, the next one closes the library.
+      if (search?.value) {
+        search.value = "";
+        library.query = "";
+        renderLibrary(true);
+      } else closeClaimedLibrary();
+    } else if (event.key === "/" && document.activeElement !== search) {
+      event.preventDefault();
+      search?.focus();
+    }
+  });
+
+  let searchTimer = null;
+  $("#lib-search")?.addEventListener("input", (event) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      library.query = event.target.value.trim();
+      renderLibrary(true);
+    }, 80);
+  });
+  $("#lib-sort")?.addEventListener("change", (event) => {
+    library.sort = event.target.value;
+    renderLibrary(true);
+  });
+  $("#lib-chips")?.addEventListener("click", (event) => {
+    const chip = event.target.closest(".lib-chip");
+    if (!chip) return;
+    library.filter = chip.dataset.filter;
+    renderLibrary(true);
+  });
+  $("#lib-sync")?.addEventListener("click", async () => {
+    const button = $("#lib-sync");
+    button.disabled = true;
+    button.classList.add("refreshing");
+    setStatus("Syncing Epic library…");
+    const response = await send({ type: "sync-library" });
+    button.disabled = false;
+    button.classList.remove("refreshing");
+    await loadState();
+    if (response.ok && !response.library?.error) setStatus(`Library synced (${response.library.itemCount} owned item(s)).`);
+    else setStatus(`Library sync failed: ${response.error || response.library?.error}`);
   });
 
   // Kill Instance Button
@@ -192,6 +251,13 @@ function render() {
     } else if (accountEmail) {
       accountEmail.classList.add("hidden");
     }
+  } else if (isLoggedOut && auth.remembered) {
+    // The ~8 hour web session lapsed; claims reselect the remembered account.
+    accountStatus.textContent = "Session expired";
+    accountStatus.className = "status-disconnected";
+    setupCard.classList.add("hidden");
+    if (logoutBtn) logoutBtn.classList.remove("hidden");
+    if (accountEmail) accountEmail.classList.add("hidden");
   } else if (isLoggedOut) {
     accountStatus.textContent = "Needs Login";
     accountStatus.className = "status-disconnected";
@@ -219,7 +285,7 @@ function render() {
       runNow.disabled = true;
       if (textSpan) textSpan.textContent = "Running…";
     } else {
-      runNow.disabled = isLoggedOut;
+      runNow.disabled = isLoggedOut && !auth.remembered;
       if (textSpan) textSpan.textContent = "Manual Start";
     }
   }
@@ -245,9 +311,13 @@ function render() {
   const actionableCount = freeGames.filter((game) => !claimedGames.some((claimed) => claimed.id === game.id && isDone(claimed))).length;
   $("#epic-count-badge").textContent = `${freeGames.length} current · ${actionableCount} to claim`;
   $("#claimed-count-badge").textContent = `${doneCount} claimed`;
+  $("#claimed-count-badge").title = state.library?.syncedAt
+    ? `Synced with Epic order history ${new Date(state.library.syncedAt).toLocaleString()}`
+    : "Not yet synced with Epic order history";
 
   const errors = [...Object.values(catalog.errors || {}), ...Object.values(state.errors || {})];
   if (auth.status === "unknown" && auth.error) errors.push(auth.error);
+  if (state.library?.error) errors.push(`Library sync: ${state.library.error}`);
   setStatus(errors.length ? `Partial data — ${errors.join(" · ")}` : refreshedLabel(catalog.refreshedAt));
 }
 
@@ -295,58 +365,254 @@ function renderGames(platform, games) {
   }
 }
 
-// Render Claimed Games with Cover Banners on main panel
+// Claimed Library: a three-game preview on the main panel and a searchable,
+// month-grouped full view that renders lazily (accounts often own 200+ games).
 function renderClaimedOnMain(games) {
+  const claimed = newestClaimedGames(games);
+  const dataKey = claimed.map((game) => `${game.id}:${game.claimedAt || ""}:${game.image ? 1 : 0}`).join("|");
+  if (dataKey === library.dataKey) return;
+  library.dataKey = dataKey;
+
   const container = $("#claimed-list");
   container.replaceChildren();
-  const claimed = newestClaimedGames(games);
-  const recent = claimed.slice(0, 3);
-  if (!recent.length) {
-    container.append(empty("Claimed games will appear here."));
-  } else {
-    renderClaimedCards(container, recent);
-  }
+  if (!claimed.length) container.append(empty("Claimed games will appear here."));
+  else for (const game of claimed.slice(0, 3)) container.append(createClaimedRow(game, { showYear: true }));
+  const more = $("#claimed-preview-more");
+  if (more) more.textContent = claimed.length > 3 ? `View all ${claimed.length} games` : "Open library";
+  $(".lib-preview-footer")?.classList.toggle("hidden", claimed.length === 0);
 
-  const allContainer = $("#claimed-library-all-list");
-  if (allContainer) {
-    allContainer.replaceChildren();
-    if (claimed.length) renderClaimedCards(allContainer, claimed, 3);
-    else allContainer.append(empty("No claimed games yet."));
-  }
-  const modalCount = $("#claimed-library-modal-count");
-  if (modalCount) modalCount.textContent = `${claimed.length} claimed game${claimed.length === 1 ? "" : "s"}`;
+  renderLibrary(false);
 }
 
 function newestClaimedGames(games) {
-  return games.filter(isDone).slice().sort((left, right) => {
-    const leftTime = Date.parse(left.claimedAt || "") || 0;
-    const rightTime = Date.parse(right.claimedAt || "") || 0;
-    return rightTime - leftTime;
-  });
+  return games.filter(isDone).slice().sort((left, right) => claimedTime(right) - claimedTime(left));
 }
 
-function renderClaimedCards(container, games, highlightedCount = 0) {
-  games.forEach((game, index) => {
-    const card = createClaimedCard(game);
-    if (index < highlightedCount) card.classList.add("is-recent-preview");
-    container.append(card);
-  });
+function claimedTime(game) {
+  return Date.parse(game.claimedAt || "") || 0;
 }
 
-function createClaimedCard(game) {
-  const card = $("#claimed-template").content.firstElementChild.cloneNode(true);
-  makeGameCardOpenable(card, game);
-  const img = card.querySelector(".claimed-cover");
-  if (game.image) {
-    img.src = game.image;
-    img.alt = "";
-    img.addEventListener("error", () => card.querySelector(".m3-cover-wrapper").remove());
-  } else {
-    card.querySelector(".m3-cover-wrapper").remove();
+function isFromAccount(game) {
+  return game.source === "epic_account";
+}
+
+function libraryCounts(games) {
+  const year = new Date().getFullYear();
+  return {
+    all: games.length,
+    extension: games.filter((game) => !isFromAccount(game)).length,
+    account: games.filter(isFromAccount).length,
+    thisYear: games.filter((game) => new Date(claimedTime(game)).getFullYear() === year).length
+  };
+}
+
+function filteredLibrary(games) {
+  const query = searchKey(library.query);
+  const filtered = games.filter((game) => {
+    if (library.filter === "extension" && isFromAccount(game)) return false;
+    if (library.filter === "account" && !isFromAccount(game)) return false;
+    return !query || searchKey(game.title).includes(query);
+  });
+  if (library.sort === "oldest") filtered.reverse();
+  if (library.sort === "title") filtered.sort((left, right) => String(left.title || "").localeCompare(String(right.title || ""), undefined, { sensitivity: "base" }));
+  return filtered;
+}
+
+function searchKey(value) {
+  return String(value || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+}
+
+// Re-render only when the data or the view settings change, so the 5-second
+// state poll keeps the user's scroll position and search text intact.
+function renderLibrary(resetScroll) {
+  const modal = $("#claimed-library-modal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  const all = newestClaimedGames(state.claimedGames);
+  if (resetScroll) library.limit = LIBRARY_PAGE_SIZE;
+  const viewKey = [library.dataKey, library.query, library.filter, library.sort, library.limit].join("§");
+  if (!resetScroll && viewKey === library.viewKey) return;
+  library.viewKey = viewKey;
+
+  const counts = libraryCounts(all);
+  const synced = state.library?.syncedAt ? `Synced ${formatRelative(state.library.syncedAt)}` : "Not synced with Epic yet";
+  $("#claimed-library-modal-count").textContent = `${counts.all} game${counts.all === 1 ? "" : "s"} · ${synced}`;
+  renderLibraryStats(counts);
+  for (const chip of document.querySelectorAll(".lib-chip")) {
+    const active = chip.dataset.filter === library.filter;
+    chip.classList.toggle("is-active", active);
+    chip.setAttribute("aria-selected", String(active));
+    chip.querySelector("span").textContent = counts[chip.dataset.filter];
   }
-  card.querySelector(".claimed-title").textContent = game.title;
-  card.querySelector(".claimed-date").textContent = formatDate(game.claimedAt);
+  const search = $("#lib-search");
+  if (search) search.placeholder = `Search ${counts.all} games`;
+
+  const list = $("#claimed-library-all-list");
+  const scrollTop = list.scrollTop;
+  library.observer?.disconnect();
+  list.replaceChildren();
+
+  const games = filteredLibrary(all);
+  if (!games.length) {
+    const box = document.createElement("div");
+    box.className = "lib-empty";
+    const title = document.createElement("strong");
+    title.textContent = library.query ? `No games match "${library.query}"` : "Nothing here yet";
+    const hint = document.createElement("span");
+    hint.textContent = library.query ? "Try a shorter search or another filter." : "Claimed and synced games will show up here.";
+    box.append(title, hint);
+    list.append(box);
+    return;
+  }
+
+  const visible = games.slice(0, library.limit);
+  let currentGroup = null;
+  const groupCounts = new Map();
+  for (const game of games) {
+    const key = groupKey(game);
+    groupCounts.set(key, (groupCounts.get(key) || 0) + 1);
+  }
+  const fragment = document.createDocumentFragment();
+  for (const game of visible) {
+    const key = groupKey(game);
+    if (key !== currentGroup) {
+      currentGroup = key;
+      const header = document.createElement("div");
+      header.className = "lib-group-header";
+      header.textContent = groupLabel(game);
+      const count = document.createElement("span");
+      count.textContent = String(groupCounts.get(key));
+      header.append(count);
+      fragment.append(header);
+    }
+    fragment.append(createClaimedRow(game, { highlight: library.query, showYear: library.sort === "title" }));
+  }
+  list.append(fragment);
+
+  if (games.length > visible.length) {
+    const sentinel = document.createElement("div");
+    sentinel.className = "lib-sentinel";
+    list.append(sentinel);
+    library.observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      library.limit += LIBRARY_PAGE_SIZE;
+      renderLibrary(false);
+    }, { root: list, rootMargin: "240px" });
+    library.observer.observe(sentinel);
+  }
+  if (resetScroll) list.scrollTop = 0;
+  else list.scrollTop = scrollTop;
+}
+
+function renderLibraryStats(counts) {
+  const stats = $("#lib-stats");
+  if (!stats) return;
+  stats.replaceChildren();
+  const tiles = [
+    ["Total owned", counts.all, true],
+    [`In ${new Date().getFullYear()}`, counts.thisYear, false],
+    ["Claimed here", counts.extension, false]
+  ];
+  for (const [label, value, accent] of tiles) {
+    const tile = document.createElement("div");
+    tile.className = `lib-stat${accent ? " is-accent" : ""}`;
+    const number = document.createElement("strong");
+    number.textContent = String(value);
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    tile.append(number, caption);
+    stats.append(tile);
+  }
+}
+
+function groupKey(game) {
+  if (library.sort === "title") {
+    const first = searchKey(game.title).trim().charAt(0);
+    return /[a-z]/.test(first) ? first : "#";
+  }
+  const time = claimedTime(game);
+  if (!time) return "unknown";
+  const date = new Date(time);
+  return `${date.getFullYear()}-${date.getMonth()}`;
+}
+
+function groupLabel(game) {
+  const key = groupKey(game);
+  if (library.sort === "title") return key.toUpperCase();
+  if (key === "unknown") return "Unknown date";
+  return new Date(claimedTime(game)).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+}
+
+function createClaimedRow(game, { highlight = "", showYear = false } = {}) {
+  const card = $("#claimed-template").content.firstElementChild.cloneNode(true);
+  // Imported account items have no store URL; a store search still finds them.
+  const url = game.url || `https://store.epicgames.com/en-US/browse?q=${encodeURIComponent(game.title || "")}`;
+  makeGameCardOpenable(card, { ...game, url });
+
+  const thumb = card.querySelector(".lib-thumb");
+  thumb.style.setProperty("--hue", String(titleHue(game.title)));
+  card.querySelector(".lib-monogram").textContent = monogram(game.title);
+  if (game.image) {
+    const img = document.createElement("img");
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.src = game.image;
+    img.addEventListener("error", () => img.remove());
+    thumb.append(img);
+  }
+
+  appendHighlighted(card.querySelector(".lib-row-title"), game.title || "Untitled", highlight);
+  card.querySelector(".lib-row-meta").textContent = formatClaimedDate(game.claimedAt, showYear);
+  const source = card.querySelector(".lib-source");
+  const fromAccount = isFromAccount(game);
+  source.textContent = fromAccount ? "Account" : "Claimed";
+  source.classList.add(fromAccount ? "is-account" : "is-extension");
+  source.title = fromAccount ? "Found in your Epic order history" : "Claimed by this extension";
+  if (Date.now() - claimedTime(game) < RECENT_DAYS * 86_400_000) card.classList.add("is-recent");
   return card;
+}
+
+function appendHighlighted(element, text, query) {
+  const needle = searchKey(query);
+  const index = needle ? searchKey(text).indexOf(needle) : -1;
+  // searchKey keeps string length for Latin text; fall back to plain text otherwise.
+  if (index < 0 || searchKey(text).length !== text.length) {
+    element.textContent = text;
+    return;
+  }
+  const mark = document.createElement("mark");
+  mark.textContent = text.slice(index, index + needle.length);
+  element.append(text.slice(0, index), mark, text.slice(index + needle.length));
+}
+
+function monogram(title) {
+  const words = String(title || "?").replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+  if (!words.length) return "?";
+  return (words.length === 1 ? words[0].slice(0, 2) : words[0][0] + words[1][0]).toUpperCase();
+}
+
+function titleHue(title) {
+  let hash = 0;
+  for (const char of String(title || "")) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  return hash % 360;
+}
+
+function formatClaimedDate(isoStr, showYear) {
+  const date = new Date(isoStr || "");
+  if (Number.isNaN(date.getTime())) return "Date unknown";
+  return date.toLocaleDateString("en-US", showYear || date.getFullYear() !== new Date().getFullYear()
+    ? { month: "short", day: "numeric", year: "numeric" }
+    : { weekday: "short", month: "short", day: "numeric" });
+}
+
+function formatRelative(isoStr) {
+  const minutes = Math.round((Date.now() - Date.parse(isoStr)) / 60_000);
+  if (!Number.isFinite(minutes)) return "";
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return new Date(isoStr).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 function makeGameCardOpenable(card, game) {
@@ -369,13 +635,6 @@ function makeGameCardOpenable(card, game) {
       open();
     }
   });
-}
-
-function formatDate(isoStr) {
-  if (!isoStr) return "Claimed";
-  const d = new Date(isoStr);
-  if (Number.isNaN(d.getTime())) return "Claimed";
-  return `Claimed on ${d.toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function isDone(game) {

@@ -9,6 +9,18 @@
     place_order: ['place order', 'dat hang', 'confirm order', 'xac nhan dat hang']
   };
 
+  const OWNED_LABELS = ['owned', 'in library', 'already purchased', 'already owned', 'in your library',
+    'da so huu', 'trong thu vien', 'da co trong thu vien'];
+  const ORDER_SUCCESS_PHRASES = ['thanks for your order', 'thank you for your order', 'order complete',
+    'order confirmed', 'added to your library', 'cam on ban da dat hang', 'da them vao thu vien'];
+
+  function isOwnershipText(value) {
+    const text = normalize(value).replace(/[!.]+$/, '');
+    if (!text) return false;
+    return OWNED_LABELS.some((label) => text === label || text.startsWith(label + ' '))
+      || ORDER_SUCCESS_PHRASES.some((phrase) => text.includes(phrase));
+  }
+
   function normalize(value) {
     return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
       .replace(/đ/g, 'd').replace(/\s+/g, ' ').trim();
@@ -49,6 +61,42 @@
     return 'unknown';
   }
 
+  // Epic's web session (EPIC_SSO) lasts about 8 hours; after that a purchase
+  // sends the tab to www.epicgames.com/id/login/switch-account ("Welcome back"),
+  // which lists the remembered account(s). Only a lone remembered account is
+  // safe to pick automatically; a password or MFA prompt always needs the user.
+  const ACCOUNT_PICKER_EXCLUDED = [
+    'another account', 'different account', 'other account', 'add account', 'switch account',
+    'sign up', 'create', 'forgot', 'privacy', 'terms', 'help', 'support', 'back', 'close', 'cancel',
+    'cookie', 'accept', 'reject', 'decline', 'settings', 'log out', 'sign out', 'logout', 'remove',
+    'language', 'english', 'show password', 'hide password', 'learn more', 'more options',
+    'sign in with', 'continue with', 'facebook', 'google', 'apple', 'xbox', 'playstation', 'nintendo',
+    'steam', 'lego', 'tai khoan khac', 'dang ky'
+  ];
+
+  function isAccountPickerUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname === 'www.epicgames.com' && /^\/id\/login(?:\/|$)/i.test(parsed.pathname);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function classifyAccountPicker({ url = '', bodyText = '', hasPasswordField = false, candidates = [] } = {}) {
+    if (!isAccountPickerUrl(url)) return { state: 'none', index: -1 };
+    const page = normalize(bodyText);
+    const picker = /\/switch-account(?:$|[/?#])/i.test(url) || page.includes('welcome back') || page.includes('chao mung tro lai');
+    if (!picker) return { state: hasPasswordField ? 'password' : 'none', index: -1 };
+    if (hasPasswordField) return { state: 'password', index: -1 };
+    const eligible = candidates
+      .map((label, index) => ({ label: normalize(label), index }))
+      .filter(({ label }) => label && label.length <= 160
+        && !ACCOUNT_PICKER_EXCLUDED.some((word) => label === word || label.startsWith(word + ' ') || label.includes(word)));
+    if (eligible.length === 1) return { state: 'single', index: eligible[0].index };
+    return { state: eligible.length === 0 ? 'no_account' : 'ambiguous', index: -1, count: eligible.length };
+  }
+
   function actionMatches(label, wanted) {
     return label === wanted;
   }
@@ -61,7 +109,9 @@
     ownershipText = '',
     context = 'unknown',
     catalogEligible = false,
-    identityMatch = null
+    identityMatch = null,
+    checkoutOverlay = false,
+    accountPicker = null
   } = {}) {
     const page = normalize(bodyText);
     const visibleButtons = buttons
@@ -100,9 +150,7 @@
       }, 'unknown');
     }
 
-    const ownershipVisible = ['owned', 'in library', 'already purchased', 'da so huu', 'trong thu vien',
-      'thanks for your order!', 'thanks for your order', 'thank you for your order!']
-      .includes(normalize(ownershipText));
+    const ownershipVisible = isOwnershipText(ownershipText);
     const blockers = [];
     if (page.includes('captcha')) blockers.push('captcha');
     const hasTermsContext = page.includes('terms of service')
@@ -136,6 +184,8 @@
     return {
       context,
       identityMatch,
+      checkoutOverlay: Boolean(checkoutOverlay),
+      accountPicker: accountPicker || null,
       catalogEligible: Boolean(catalogEligible),
       ownershipVisible,
       visibleActions,
@@ -146,5 +196,5 @@
     };
   }
 
-  return { buildEpicObservation, normalize, priceEvidence };
+  return { buildEpicObservation, normalize, priceEvidence, isOwnershipText, OWNED_LABELS, classifyAccountPicker, isAccountPickerUrl };
 });

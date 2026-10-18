@@ -1,4 +1,4 @@
-const { buildEpicObservation, normalize, priceEvidence } = FreebiesEpicObservation;
+const { buildEpicObservation, normalize, priceEvidence, isOwnershipText, OWNED_LABELS, classifyAccountPicker, isAccountPickerUrl } = FreebiesEpicObservation;
 const ACTION_LABELS = {
   get: ['get', 'get now', 'nhan', 'nhan ngay'],
   add_to_library: ['add to library', 'them vao thu vien'],
@@ -14,6 +14,8 @@ let observationTimer = null;
 let lastMessageError = '';
 
 initializeClaimObserver().catch((error) => {
+  // A broken child frame must not end the whole claim; only the top frame reports.
+  if (window.top !== window || !activeTask) return;
   void send({ type: 'claim-result', frameContext: detectContext(), platform: 'epic', id: activeTask?.gameId, status: 'failed', detail: error.message || String(error) });
 });
 
@@ -63,8 +65,29 @@ function runObservation() {
     .finally(() => { observationInFlight = false; });
 }
 
+function accountPickerCandidates() {
+  return [...document.querySelectorAll('button, a[href], [role="button"], [role="link"], [role="option"], li[tabindex]')]
+    .filter((element) => isVisible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true')
+    // Nested controls (a tile inside a list item) would count the account twice.
+    .filter((element, index, all) => !all.some((other) => other !== element && other.contains(element)));
+}
+
+function readAccountPicker() {
+  if (window.top !== window || !isAccountPickerUrl(location.href)) return null;
+  const elements = accountPickerCandidates();
+  const passwordField = [...document.querySelectorAll('input[type="password"], input[autocomplete="one-time-code"]')].some(isVisible);
+  const result = classifyAccountPicker({
+    url: location.href,
+    bodyText: document.body?.innerText || '',
+    hasPasswordField: passwordField,
+    candidates: elements.map((element) => element.innerText || element.textContent || element.getAttribute('aria-label'))
+  });
+  return { ...result, element: elements[result.index] || null, labels: elements.map((element) => normalize(element.innerText || element.textContent || element.getAttribute('aria-label')).slice(0, 40)) };
+}
+
 function collectObservation() {
   const context = detectContext();
+  const picker = readAccountPicker();
   const buttons = actionElements()
     .map((element) => ({
       label: element.innerText || element.textContent,
@@ -86,7 +109,24 @@ function collectObservation() {
     ownershipText: readOwnershipText(),
     context,
     catalogEligible: activeTask.catalogEligible === true,
-    identityMatch: identifyPage()
+    identityMatch: identifyPage(),
+    checkoutOverlay: context !== 'checkout' && hasCheckoutOverlay(),
+    accountPicker: picker && picker.state !== 'none'
+      ? { state: picker.state, count: picker.count || 0, labels: picker.state === 'single' ? [] : maskLabels(picker.labels) }
+      : null
+  });
+}
+
+// Labels on Epic's login page can contain the account email; keep logs local and masked.
+function maskLabels(labels) {
+  return labels.slice(0, 8).map((label) => label.replace(/[^\s@]+@[^\s@]+/g, '<email>'));
+}
+
+// The product page keeps its Get button rendered behind Epic's checkout modal.
+function hasCheckoutOverlay() {
+  return [...document.querySelectorAll('iframe')].some((frame) => {
+    const src = String(frame.src || '');
+    return /(?:\/purchase|\/checkout|payment-website-pci)/i.test(src) && isVisible(frame);
   });
 }
 
@@ -105,9 +145,23 @@ async function observePage() {
   } else if (response.decision.action === 'click_confirm') {
     const action = observation.visibleActions.includes('place_order') ? 'place_order' : 'add_to_library';
     await clickAction(action, observation);
+  } else if (response.decision.action === 'click_account') {
+    await clickRememberedAccount();
   } else if (response.decision.action === 'complete_owned') {
     stopObserver();
   }
+}
+
+async function clickRememberedAccount() {
+  // Re-read the page: the worker decision is asynchronous.
+  const picker = readAccountPicker();
+  if (!picker || picker.state !== 'single' || !picker.element) {
+    await send({ type: 'claim-action-result', frameContext: 'login', action: 'pick_account', success: false, detail: `Account picker is ${picker?.state || 'gone'}.` });
+    return false;
+  }
+  picker.element.click();
+  await send({ type: 'claim-action-result', frameContext: 'login', action: 'pick_account', success: true, detail: 'Selected the remembered Epic account.' });
+  return true;
 }
 
 async function clickAction(action, observation) {
@@ -192,13 +246,22 @@ function extractTotalText(rawText) {
 function readOwnershipText() {
   const purchase = document.querySelector('[data-testid="purchase-cta-button"]');
   if (purchase && isVisible(purchase)) {
-    const label = normalize(purchase.innerText || purchase.textContent);
-    if (['owned', 'in library', 'already purchased', 'da so huu', 'trong thu vien'].includes(label)) return label;
+    const label = normalize(purchase.innerText || purchase.textContent || purchase.getAttribute('aria-label'));
+    if (isOwnershipText(label)) return label;
   }
+  // Epic has shipped the owned state as a disabled button, a link to the library,
+  // or a plain badge; accept any short visible control whose whole label says so.
+  // A visible Get means the base game is not owned (an owned add-on may say "Owned").
+  const owned = !findActionButton('get') && [...document.querySelectorAll('button, a, [role="button"], [data-testid*="purchase"], [data-testid*="cta"]')]
+    .find((element) => {
+      if (!isVisible(element)) return false;
+      const label = normalize(element.innerText || element.textContent || element.getAttribute('aria-label'));
+      return label.length <= 40 && OWNED_LABELS.some((wanted) => label === wanted);
+    });
+  if (owned) return normalize(owned.innerText || owned.textContent || owned.getAttribute('aria-label'));
   if (detectContext() === 'checkout') {
-    const success = [...document.querySelectorAll('h1, h2, h3, [role="heading"], [data-testid="order-success"]')]
-      .find((element) => isVisible(element) && ['thanks for your order!', 'thanks for your order', 'thank you for your order!']
-        .includes(normalize(element.innerText || element.textContent)));
+    const success = [...document.querySelectorAll('h1, h2, h3, [role="heading"], [role="alert"], [data-testid="order-success"]')]
+      .find((element) => isVisible(element) && isOwnershipText(element.innerText || element.textContent));
     if (success) return normalize(success.innerText || success.textContent);
   }
   return '';

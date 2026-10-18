@@ -1,4 +1,4 @@
-importScripts("core/state-model.js", "core/auth-model.js", "core/auth-client.js", "core/claim-machine.js", "core/claim-routing.js", "core/claim-queue.js");
+importScripts("core/state-model.js", "core/auth-model.js", "core/auth-client.js", "core/claim-machine.js", "core/claim-routing.js", "core/claim-queue.js", "core/epic-library.js");
 
 const { DEFAULT_SETTINGS: MODEL_DEFAULT_SETTINGS, normalizeSettings, normalizeClaimedGames, migrateStoredState, buildStateSnapshot } = FreebiesStateModel;
 const { resolveAuthObservation, shouldLogAuthTransition } = FreebiesAuthModel;
@@ -6,6 +6,7 @@ const { fetchLoginState: fetchEpicLoginState } = FreebiesAuthClient;
 const { createClaimTask, reduceClaimTask } = FreebiesClaimMachine;
 const { findClaimableGameForUrl } = FreebiesClaimRouting;
 const { createClaimQueue, beginNextClaim, rebindCurrentClaim, finishCurrentClaim, skipNextClaim, cancelClaimQueue } = FreebiesClaimQueue;
+const { orderHistoryUrl, parseOrderHistory, findOwnedItem, mergeOwnedIntoClaimed } = FreebiesEpicLibrary;
 
 const CATALOG_KEY = "catalog";
 const CLAIMED_KEY = "claimedGames";
@@ -16,8 +17,25 @@ const TASKS_KEY = "activeClaimTasks";
 const CLAIM_QUEUE_KEY = "claimQueue";
 const STORAGE_VERSION_KEY = "storageSchemaVersion";
 const MIGRATION_BACKUP_KEY = "migrationBackupV2";
+const LIBRARY_KEY = "epicLibrary";
+const SCHEDULE_STATE_KEY = "scheduleState";
 const ALARM_NAME = "freebies-daily-check";
 const CLAIM_WATCHDOG_ALARM = "freebies-claim-watchdog";
+const STARTUP_RETRY_ALARM = "freebies-startup-retry";
+const NEXT_DROP_ALARM = "freebies-next-drop";
+const SCHEDULED_CHECK_MINUTES = 60;
+const STARTUP_RETRY_LIMIT = 5;
+const CATALOG_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const LIBRARY_SYNC_TTL_MS = 30 * 60 * 1000;
+const LIBRARY_MAX_PAGES = 40;
+const OWNERSHIP_CHECK_INTERVAL_MS = 10_000;
+const OWNERSHIP_CHECK_GRACE_MS = 20_000;
+const CONFIRM_RELOAD_MS = 25_000;
+const NEEDS_ATTENTION_TIMEOUT_MS = 15 * 60 * 1000;
+const AUTO_RETRY_COOLDOWN_MS = 3 * 60 * 60 * 1000;
+const CLAIMED_LIMIT = 2000;
+const MAX_ACCOUNT_PICKS = 2;
+const ACCOUNT_PICK_INTERVAL_MS = 8000;
 const AUTH_CACHE_TTL_MS = 15000;
 const AUTH_CHANGE_DEBOUNCE_MS = 750;
 const NOTIFICATION_COVER_TIMEOUT_MS = 2000;
@@ -33,6 +51,9 @@ let authRefreshInFlight = false;
 let authRefreshQueued = false;
 let claimQueuePumpPromise = null;
 let claimStateMutation = Promise.resolve();
+let claimQueueLock = Promise.resolve();
+let scheduledCheckPromise = null;
+let librarySyncPromise = null;
 let sessionLogMutation = Promise.resolve();
 const claimTaskMutations = new Map();
 const claimLogKeys = new Map();
@@ -104,40 +125,76 @@ function formatLogTimestamp(date = new Date()) {
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureSettings();
   await addLog("Extension installed / reloaded.");
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1440 });
-  chrome.alarms.create(CLAIM_WATCHDOG_ALARM, { periodInMinutes: 1 });
+  await ensureAlarms();
   await refreshCatalog({ force: true });
+  await runScheduledCheck("install");
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   await ensureSettings();
   await addLog("Browser startup detected.");
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1440 });
-  chrome.alarms.create(CLAIM_WATCHDOG_ALARM, { periodInMinutes: 1 });
+  await ensureAlarms();
   await reconcileClaimState();
-  if ((await getSettings()).runOnStartup) await runDailyCheck();
+  await saveScheduleState({ startupRetries: 0 });
+  if ((await getSettings()).runOnStartup) await runScheduledCheck("startup");
   else await addLog("Startup check skipped: Run on browser startup is disabled.");
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === ALARM_NAME) await runDailyCheck();
+  if (alarm.name === ALARM_NAME) await runScheduledCheck("periodic");
+  if (alarm.name === STARTUP_RETRY_ALARM) await runScheduledCheck("startup-retry");
+  if (alarm.name === NEXT_DROP_ALARM) await runScheduledCheck("new-drop");
   if (alarm.name === CLAIM_WATCHDOG_ALARM) await reconcileClaimState();
 });
 
+// Re-creating a periodic alarm restarts its countdown, so recreate it only when
+// it is missing or still uses an older period.
+async function ensureAlarms() {
+  const getAlarm = (name) => Promise.resolve(chrome.alarms.get?.(name)).catch(() => null);
+  const periodic = await getAlarm(ALARM_NAME);
+  if (!periodic || periodic.periodInMinutes !== SCHEDULED_CHECK_MINUTES) {
+    chrome.alarms.create(ALARM_NAME, { delayInMinutes: 1, periodInMinutes: SCHEDULED_CHECK_MINUTES });
+  }
+  const watchdog = await getAlarm(CLAIM_WATCHDOG_ALARM);
+  if (!watchdog) chrome.alarms.create(CLAIM_WATCHDOG_ALARM, { periodInMinutes: 1 });
+}
+
+// Every queue read-modify-write runs through this lock so tab events, the
+// watchdog and popup polling cannot overwrite each other's queue state.
+function withQueueLock(operation) {
+  const run = claimQueueLock.then(operation, operation);
+  claimQueueLock = run.catch(() => {});
+  return run;
+}
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const task = await getActiveTask(tabId);
   spawnedClaimTabIds.delete(tabId);
-  await removeActiveTask(tabId);
-  if (task) {
+  // Every extension-initiated close removes the task first, so only a tab the
+  // user (or Epic) closed reaches the locked path below.
+  if (!await getActiveTask(tabId)) return;
+  await withQueueLock(async () => {
+    const task = await getActiveTask(tabId);
+    if (!task) return;
+    await removeActiveTask(tabId);
+    // The order may have gone through even though the page never showed it.
+    if (task.attempts > 0 && await isOwnedOnAccount(task)) {
+      await completeOwnedTask(task, tabId, "Epic order history confirms ownership.", { closeTab: false });
+      return;
+    }
     const detail = "Claim tab was closed before Epic confirmed ownership.";
     await recordClaimStatus(task.platform || "epic", task.gameId, "failed", detail);
-    await addLog(`Claim failed for ${task.gameId}: ${detail}`);
+    await addLog(`Claim failed for "${safeLogDetail(task.title || task.gameId, 100)}": ${detail}`);
     await finishSerialQueueItem(tabId, "failed", detail);
-  }
+  });
 });
 
 chrome.tabs.onCreated.addListener(async (tab) => {
   if (!tab?.id || !tab.openerTabId) return;
+  if (!await getActiveTask(tab.openerTabId)) return;
+  await withQueueLock(() => rebindClaimToChildTab(tab));
+});
+
+async function rebindClaimToChildTab(tab) {
   const task = await getActiveTask(tab.openerTabId);
   if (!task) return;
   await removeActiveTask(tab.openerTabId);
@@ -158,7 +215,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   spawnedClaimTabIds.add(tab.id);
   await addLog(`Rebound claim task for ${task.gameId} to child tab #${tab.id}.`);
   await restoreUserTabAfterClaimChild(task, tab);
-});
+}
 
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   const activatedTab = await chrome.tabs.get(tabId).catch(() => null);
@@ -182,6 +239,7 @@ chrome.cookies.onChanged.addListener(async (changeInfo) => {
     cookie.name === "EPIC_EG1" ||
     cookie.name === "EPIC_SSO" ||
     cookie.name === "EPIC_SESSION_AP" ||
+    cookie.name === "EPIC_SSO_RM" ||
     cookie.name === "remember_me"
   ) {
     scheduleAuthRefresh();
@@ -251,6 +309,96 @@ async function logClaimObservation(task, sender, observation, decision) {
   await addUniqueClaimLog(claimObservationDiagnosticKey(task, sender, observation, decision), detail);
 }
 
+// Epic's web session expires after ~8 hours; the next purchase then detours
+// through the "Welcome back" account picker. Pick a lone remembered account so
+// the purchase intent resumes; anything else (password, MFA, several accounts)
+// pauses the claim for the user.
+async function handleAccountPicker(task, sender, observation) {
+  const picker = observation.accountPicker;
+  const now = Date.now();
+  const title = safeLogDetail(task.title || task.gameId, 100);
+  const picks = task.accountPicks || 0;
+  if (picker.state === "single" && picks < MAX_ACCOUNT_PICKS) {
+    if (now - (task.lastAccountPickAt || 0) < ACCOUNT_PICK_INTERVAL_MS) {
+      return { task, decision: { action: "wait", reason: "Waiting for Epic to finish signing in." } };
+    }
+    const next = {
+      ...task,
+      phase: task.phase === "needs_attention" ? (task.resumePhase || "awaiting_outcome") : task.phase,
+      terminalReason: null,
+      accountPicks: picks + 1,
+      lastAccountPickAt: now,
+      lastProgressAt: now,
+      pendingAction: { kind: "click_account", frameId: 0, requestedAt: now }
+    };
+    await saveActiveTask(next);
+    await addLog(`Claim "${title}": Epic session expired and asked to pick the remembered account; selecting it (${picks + 1}/${MAX_ACCOUNT_PICKS}).`);
+    return { task: next, decision: { action: "click_account", reason: "Selecting the remembered Epic account." } };
+  }
+
+  const reason = picker.state === "password"
+    ? "Epic asks for your password or a security code; sign in manually in the claim tab."
+    : picker.state === "single"
+      ? "Epic kept asking to pick the account after two attempts; sign in manually in the claim tab."
+      : `Epic's sign-in page shows ${picker.count || 0} selectable account(s); pick yours manually in the claim tab.`;
+  const paused = {
+    ...task,
+    resumePhase: task.phase === "needs_attention" ? task.resumePhase : task.phase,
+    phase: "needs_attention",
+    terminalReason: "login",
+    lastProgressAt: task.phase === "needs_attention" ? task.lastProgressAt : now
+  };
+  await saveActiveTask(paused);
+  if (task.phase !== "needs_attention" || task.terminalReason !== "login") {
+    await recordClaimStatus(task.platform || "epic", task.gameId, "needs_attention", reason);
+    const labels = (picker.labels || []).length ? ` Controls seen: ${picker.labels.join(" | ")}.` : "";
+    await addLog(`Serial queue paused for "${title}": ${reason}${safeLogDetail(labels, 300)}`);
+  }
+  return { task: paused, decision: { action: "needs_attention", reason } };
+}
+
+async function completeOwnedTask(task, tabId, reason, { closeTab = true } = {}) {
+  await recordClaimStatus(task.platform || "epic", task.gameId, "owned", reason);
+  await removeActiveTask(tabId);
+  spawnedClaimTabIds.delete(tabId);
+  if (closeTab) {
+    try { await chrome.tabs.remove(tabId); } catch (e) { /* already closed */ }
+  }
+  await finishSerialQueueItem(tabId, "owned", reason);
+}
+
+// When the page cannot prove ownership (Epic's markup changes often), fall back
+// to the account's order history, then to one reload of the product page.
+async function checkStalledClaim(task, sender) {
+  if (!task || task.phase === "needs_attention" || task.clickRetriesExhausted) return null;
+  const now = Date.now();
+  const clicked = (task.attempts || 0) > 0;
+  if (!clicked && now - (task.startedAt || now) < OWNERSHIP_CHECK_GRACE_MS) return null;
+  if (now - (task.lastOwnershipCheckAt || 0) < OWNERSHIP_CHECK_INTERVAL_MS) return null;
+
+  // Mutate the reduced task in place so the caller's save keeps the throttle stamp.
+  task.lastOwnershipCheckAt = now;
+  const checked = task;
+  if (await isOwnedOnAccount(task)) {
+    const reason = "Epic order history confirms ownership.";
+    await withQueueLock(() => completeOwnedTask(task, sender.tab.id, reason));
+    return { task: { ...checked, phase: "completed" }, decision: { action: "complete_owned", reason } };
+  }
+
+  const sinceAction = now - (task.lastActionAt || now);
+  if (task.phase === "confirmation_clicked" && sinceAction >= CONFIRM_RELOAD_MS && !task.reloadedAfterConfirm) {
+    // A reload re-renders the CTA as "In Library", or shows Get again if the
+    // order did not go through; either way the observer can decide again.
+    const reloaded = { ...checked, reloadedAfterConfirm: true, phase: "waiting_for_get", pendingAction: null, lastProgressAt: now };
+    await saveActiveTask(reloaded);
+    await chrome.tabs.reload(sender.tab.id).catch(() => {});
+    const reason = "No ownership signal after the order click; reloading the product page.";
+    await addLog(`Claim "${safeLogDetail(task.title || task.gameId, 100)}": ${reason}`);
+    return { task: reloaded, decision: { action: "wait", reason } };
+  }
+  return null;
+}
+
 async function handleMessage(message, sender) {
   switch (message.type) {
     case "get-state":
@@ -278,9 +426,11 @@ async function handleMessage(message, sender) {
     case "check-login-status":
       return checkEpicLoginStatus({ force: true });
     case "claim-item":
-      if ((await getClaimQueue())?.status === "running" || (await getActiveTasks()).length > 0) throw new Error("A claim is already running.");
-      await queueClaim(message.platform, message.id, false);
-      return {};
+      return withQueueLock(async () => {
+        if ((await getClaimQueue())?.status === "running" || (await getActiveTasks()).length > 0) throw new Error("A claim is already running.");
+        await queueClaim(message.platform, message.id, false);
+        return {};
+      });
     case "claim-ready":
       if (!sender?.tab?.id) return { task: null };
       if (sender.frameId !== 0) {
@@ -309,6 +459,9 @@ async function handleMessage(message, sender) {
           await logClaimObservation(task, sender, observation, decision);
           return { task, decision };
         }
+        if (sender.frameId === 0 && observation.accountPicker) {
+          return handleAccountPicker(task, sender, observation);
+        }
         if (sender.frameId === 0 && observation.identityMatch === false) {
           const decision = { action: "wait", reason: "Waiting for the queued product page." };
           await logClaimObservation(task, sender, observation, decision);
@@ -323,6 +476,13 @@ async function handleMessage(message, sender) {
           return { task, decision };
         }
         const reduced = reduceClaimTask({ ...task, frameId: sender.frameId ?? task.frameId }, observation, Date.now());
+        if (reduced.decision.action === "wait") {
+          const fallback = await checkStalledClaim(reduced.task, sender);
+          if (fallback) {
+            await logClaimObservation(task, sender, observation, fallback.decision);
+            return fallback;
+          }
+        }
         await logClaimObservation(task, sender, observation, reduced.decision);
         const taskWithAction = ['click_get', 'click_confirm'].includes(reduced.decision.action)
           ? {
@@ -336,11 +496,7 @@ async function handleMessage(message, sender) {
           : reduced.task;
         await saveActiveTask(taskWithAction);
         if (reduced.decision.action === "complete_owned") {
-          await recordClaimStatus(task.platform || "epic", task.gameId, "owned", reduced.decision.reason);
-          await removeActiveTask(sender.tab.id);
-          spawnedClaimTabIds.delete(sender.tab.id);
-          try { await chrome.tabs.remove(sender.tab.id); } catch (e) { /* already closed */ }
-          await finishSerialQueueItem(sender.tab.id, "owned", reduced.decision.reason);
+          await withQueueLock(() => completeOwnedTask(task, sender.tab.id, reduced.decision.reason));
         } else if (reduced.decision.action === "needs_attention") {
           if (task.phase !== "needs_attention" || task.terminalReason !== reduced.task.terminalReason) {
             await recordClaimStatus(task.platform || "epic", task.gameId, "needs_attention", reduced.decision.reason);
@@ -362,6 +518,7 @@ async function handleMessage(message, sender) {
           const pending = task.pendingAction;
           const matchesPending = pending && pending.frameId === (sender.frameId || 0)
             && ((pending.kind === "click_get" && action === "get")
+              || (pending.kind === "click_account" && action === "pick_account")
               || (pending.kind === "click_confirm" && ['add_to_library', 'place_order'].includes(action)));
           await addClaimLog(`action:${sender.tab.id}:${sender.frameId || 0}:${action}:${success}:${detail}`, `Claim action ${action} ${success ? "succeeded" : "failed"} for ${task.gameId}${detail ? `: ${detail}` : "."}`);
           if (!matchesPending) return;
@@ -409,22 +566,28 @@ async function handleMessage(message, sender) {
     case "claim-observer-failed": {
       if (!sender?.tab?.id) return {};
       if (sender.frameId !== 0) return {};
-      const task = await getActiveTask(sender.tab.id);
+      if (!await getActiveTask(sender.tab.id)) return {};
       // With all_frames, an unattached child must never terminate its tab task.
-      if (!task || !isTrustedClaimFrame(sender, message)) return {};
-      const detail = message.detail || "Claim observer could not attach to the active task.";
-      await recordClaimStatus(task.platform || "epic", task.gameId, "failed", detail);
-      await addLog(`Claim observer failed for ${task.gameId}: ${detail}`);
-      spawnedClaimTabIds.delete(sender.tab.id);
-      await removeActiveTask(sender.tab.id);
-      await chrome.tabs.remove(sender.tab.id).catch(() => {});
-      await finishSerialQueueItem(sender.tab.id, "failed", detail);
-      return {};
+      if (!isTrustedClaimFrame(sender, message)) return {};
+      return withQueueLock(async () => {
+        const task = await getActiveTask(sender.tab.id);
+        if (!task) return {};
+        const detail = message.detail || "Claim observer could not attach to the active task.";
+        await recordClaimStatus(task.platform || "epic", task.gameId, "failed", detail);
+        await addLog(`Claim observer failed for ${task.gameId}: ${detail}`);
+        spawnedClaimTabIds.delete(sender.tab.id);
+        await removeActiveTask(sender.tab.id);
+        await chrome.tabs.remove(sender.tab.id).catch(() => {});
+        await finishSerialQueueItem(sender.tab.id, "failed", detail);
+        return {};
+      });
     }
     case "run-claim-now":
       return { summary: await runClaimNow() };
+    case "sync-library":
+      return { library: await syncEpicLibrary({ force: true }) };
     case "kill-instance":
-      return killInstance();
+      return withQueueLock(killInstance);
     case "clear-logs":
       return clearLogs();
     case "claim-attempt":
@@ -433,20 +596,22 @@ async function handleMessage(message, sender) {
       return {};
     case "claim-result":
       if (!isTrustedClaimFrame(sender, message)) return {};
-      await recordClaimStatus(message.platform, message.id, message.status, message.detail);
-      await addLog(`Claim result for ${message.id}: ${message.status} (${message.detail || ""})`);
-      if (sender?.tab?.id) {
-        spawnedClaimTabIds.delete(sender.tab.id);
-        await removeActiveTask(sender.tab.id);
-        try {
-          await chrome.tabs.remove(sender.tab.id);
-          await addLog(`Closed claim tab #${sender.tab.id}`);
-        } catch (e) {
-          // Tab already closed
+      return withQueueLock(async () => {
+        await recordClaimStatus(message.platform, message.id, message.status, message.detail);
+        await addLog(`Claim result for ${message.id}: ${message.status} (${message.detail || ""})`);
+        if (sender?.tab?.id) {
+          spawnedClaimTabIds.delete(sender.tab.id);
+          await removeActiveTask(sender.tab.id);
+          try {
+            await chrome.tabs.remove(sender.tab.id);
+            await addLog(`Closed claim tab #${sender.tab.id}`);
+          } catch (e) {
+            // Tab already closed
+          }
+          await finishSerialQueueItem(sender.tab.id, message.status || "failed", message.detail || "Claim content script ended.");
         }
-        await finishSerialQueueItem(sender.tab.id, message.status || "failed", message.detail || "Claim content script ended.");
-      }
-      return {};
+        return {};
+      });
     default:
       throw new Error("Unsupported message");
   }
@@ -594,6 +759,7 @@ async function refreshAuthFromCookieChange() {
     if (shouldLogAuthTransition(previous, next)) {
       if (next.status === "logged_in") {
         await addLog(`Real-time auth update: Account logged in (${next.accountLabel || "Connected"}).`);
+        if ((await getScheduleState()).pendingCheck) void runScheduledCheck("login").catch(() => {});
       } else if (next.status === "logged_out") {
         await addLog("Real-time auth update: Account logged out / session ended.");
       }
@@ -630,12 +796,18 @@ async function checkEpicLoginStatus({ force = false } = {}) {
       (c.name === "remember_me" && Boolean(c.value))
     );
 
+    // EPIC_SSO_RM outlives the ~8 hour session; with it Epic offers the
+    // "Welcome back" picker, which the claim observer can complete.
+    const remembered = cookies.some((c) => c.name === "EPIC_SSO_RM" && Boolean(c.value));
     const previous = await getCachedAuth();
-    const auth = await saveAuth(resolveAuthObservation({
-      api: await fetchEpicLoginState(fetch, 4000),
-      hasAuthCookie,
-      previous
-    }));
+    const auth = await saveAuth({
+      ...resolveAuthObservation({
+        api: await fetchEpicLoginState(fetch, 4000),
+        hasAuthCookie,
+        previous
+      }),
+      remembered
+    });
     return {
       ...auth,
       isLoggedIn: auth.status === "logged_in",
@@ -669,7 +841,8 @@ async function getState() {
     getSessionLogs(),
     checkEpicLoginStatus(),
     getActiveTasks(),
-    getClaimQueue()
+    getClaimQueue(),
+    getLibraryState()
   ]);
   const value = (index, fallback) => results[index]?.status === "fulfilled" ? results[index].value : fallback;
   const settings = value(0, { ...MODEL_DEFAULT_SETTINGS, initiated: false });
@@ -679,6 +852,7 @@ async function getState() {
   const authCheck = value(4, { status: "unknown", source: "cached", isLoggedIn: false, accountEmail: null });
   const activeTasks = value(5, []);
   const claimQueue = value(6, null);
+  const library = value(7, null);
   const errors = {};
   results.forEach((result, index) => {
     if (result.status === "rejected") errors[["settings", "catalog", "claimedGames", "logs", "auth", "activeTasks", "claimQueue"][index]] = readableError(result.reason);
@@ -695,6 +869,7 @@ async function getState() {
   return {
     ...snapshot,
     claimQueue,
+    library,
     isClaimRunning: isClaimRunning || claimQueue?.status === "running" || activeTasks.length > 0,
     accountEmail: authCheck.accountEmail || authCheck.accountLabel || null
   };
@@ -790,7 +965,11 @@ async function saveClaimQueue(queue) {
   });
 }
 
-async function reconcileClaimState() {
+function reconcileClaimState() {
+  return withQueueLock(reconcileClaimStateLocked);
+}
+
+async function reconcileClaimStateLocked() {
   const queue = await getClaimQueue();
   if (!queue || queue.status !== "running") return queue;
   if (!queue.current) {
@@ -802,17 +981,25 @@ async function reconcileClaimState() {
   const task = await getActiveTask(current.tabId);
   const tab = await chrome.tabs.get(current.tabId).catch(() => null);
   const taskAge = Date.now() - (task?.lastProgressAt || current.startedAt || Date.now());
-  if (tab && task && (task.phase === "needs_attention" || taskAge < CLAIM_TIMEOUT_MS)) return queue;
+  // Manual blockers get a longer window so an unattended scan still moves on.
+  const timeout = task?.phase === "needs_attention" ? NEEDS_ATTENTION_TIMEOUT_MS : CLAIM_TIMEOUT_MS;
+  if (tab && task && taskAge < timeout) return queue;
 
   if (tab && task) {
-    const detail = "Claim timed out while waiting for Epic to confirm ownership.";
+    if (await isOwnedOnAccount(task)) {
+      await completeOwnedTask(task, current.tabId, "Epic order history confirms ownership.");
+      return getClaimQueue();
+    }
+    const detail = task.phase === "needs_attention"
+      ? `Claim stayed blocked (${task.terminalReason || "manual attention"}) for 15 minutes.`
+      : `Claim timed out in phase ${task.phase} (${safeLogDetail(task.lastObservation ? `actions=${(task.lastObservation.visibleActions || []).join(",") || "none"}, context=${task.lastObservation.context || "unknown"}` : "no page observation received", 120)}).`;
     const failed = finishCurrentClaim(queue, { tabId: current.tabId, status: "failed", detail, now: Date.now() });
     await removeActiveTask(current.tabId);
     spawnedClaimTabIds.delete(current.tabId);
     await chrome.tabs.remove(current.tabId).catch(() => {});
     await recordClaimStatus(current.platform || "epic", current.id, "failed", detail);
     await saveClaimQueue(failed);
-    await addLog(`Timed out claim for "${current.title}" after five minutes.`);
+    await addLog(`Timed out claim for "${current.title}": ${detail}`);
     if (failed.status === "completed") await finalizeSerialQueue(failed);
     else await pumpClaimQueue();
     return failed;
@@ -894,27 +1081,34 @@ function emptyCatalog() {
 
 async function refreshCatalog({ force = false } = {}) {
   const settings = await getSettings();
-  const today = localDayKey();
   const previous = (await chrome.storage.local.get(CATALOG_KEY))[CATALOG_KEY] || emptyCatalog();
 
   if (force) {
     await addLog("Force-refreshing catalog from Epic Games Store...");
   }
 
-  // Only a successful refresh is eligible for the daily cache.
-  if (!force && !previous.errors?.epic && previous.refreshedAt && previous.refreshedAt.slice(0, 10) === today) {
-    await addLog("Catalog is up-to-date for today (cached).");
+  // A successful refresh stays valid until the next promotion boundary (a game
+  // expiring or the next one starting), capped so a missed boundary self-heals.
+  const country = settings.country || "VN";
+  const validUntil = Date.parse(previous.validUntil || "");
+  if (!force && !previous.errors?.epic && previous.refreshedAt && previous.country === country
+      && Number.isFinite(validUntil) && Date.now() < validUntil) {
     return previous;
   }
 
-  const country = settings.country || "VN";
   const [epicResult] = await Promise.allSettled([fetchEpicGames(country)]);
 
   const refreshedAt = epicResult.status === "fulfilled" ? new Date().toISOString() : previous.refreshedAt || null;
-  const epicGames = epicResult.status === "fulfilled" ? epicResult.value : previous.epic || [];
+  const epicGames = epicResult.status === "fulfilled" ? epicResult.value.games : previous.epic || [];
+  const nextBoundary = epicResult.status === "fulfilled" ? epicResult.value.nextBoundary : null;
   const catalog = {
     epic: epicGames,
     refreshedAt,
+    country,
+    validUntil: epicResult.status === "fulfilled"
+      ? new Date(Math.min(Date.now() + CATALOG_MAX_AGE_MS, nextBoundary || Infinity)).toISOString()
+      : null,
+    nextBoundary: nextBoundary ? new Date(nextBoundary).toISOString() : null,
     lastAttemptAt: new Date().toISOString(),
     errors: {
       ...(epicResult.status === "rejected" ? { epic: readableError(epicResult.reason) } : {})
@@ -922,11 +1116,22 @@ async function refreshCatalog({ force = false } = {}) {
   };
   await chrome.storage.local.set({ [CATALOG_KEY]: catalog });
   if (epicResult.status === "fulfilled") {
-    await addLog(`Catalog updated: ${catalog.epic.length} free game(s) available for region ${country}.`);
+    const previousIds = (previous.epic || []).map((game) => game.id).sort().join(",");
+    const nextIds = catalog.epic.map((game) => game.id).sort().join(",");
+    if (force || previousIds !== nextIds) {
+      await addLog(`Catalog updated: ${catalog.epic.length} free game(s) available for region ${country}.`);
+    }
+    scheduleNextDropAlarm(nextBoundary);
   } else {
     await addLog(`Catalog update failed: ${readableError(epicResult.reason)}`);
   }
   return catalog;
+}
+
+function scheduleNextDropAlarm(boundary) {
+  if (!Number.isFinite(boundary)) return;
+  // Epic's catalog can lag the promotion start by a minute or two.
+  chrome.alarms.create(NEXT_DROP_ALARM, { when: Math.max(Date.now() + 60_000, boundary + 3 * 60_000) });
 }
 
 async function fetchEpicGames(country) {
@@ -941,13 +1146,24 @@ async function fetchEpicGames(country) {
   const elements = payload?.data?.Catalog?.searchStore?.elements || [];
   const now = Date.now();
 
-  return elements
+  let nextBoundary = null;
+  for (const offer of elements) {
+    for (const promotion of promotionWindows(offer)) {
+      for (const edge of [Date.parse(promotion.startDate), Date.parse(promotion.endDate)]) {
+        if (Number.isFinite(edge) && edge > now && (nextBoundary === null || edge < nextBoundary)) nextBoundary = edge;
+      }
+    }
+  }
+
+  const games = elements
     .filter((offer) => isEpicFreeNow(offer, now))
     .map((offer) => {
       const url = resolveEpicStoreUrl(offer);
       return {
         id: `epic-${offer.id}`,
         platform: "epic",
+        offerId: offer.id,
+        namespace: offer.namespace || null,
         title: offer.title,
         image: pickEpicImage(offer.keyImages),
         url,
@@ -955,6 +1171,13 @@ async function fetchEpicGames(country) {
         originalPrice: offer.price?.totalPrice?.originalPrice || 0
       };
     });
+  return { games, nextBoundary };
+}
+
+function promotionWindows(offer) {
+  const promotions = offer.promotions || {};
+  return [...(promotions.promotionalOffers || []), ...(promotions.upcomingPromotionalOffers || [])]
+    .flatMap((group) => group?.promotionalOffers || []);
 }
 
 function resolveEpicStoreUrl(offer) {
@@ -991,40 +1214,71 @@ function pickEpicImage(images = []) {
   return images[0]?.url || "";
 }
 
-async function runDailyCheck() {
-  const settings = await getSettings();
-  const authCheck = await checkEpicLoginStatus({ force: true });
-  const today = localDayKey();
+async function getScheduleState() {
+  const stored = await chrome.storage.local.get(SCHEDULE_STATE_KEY).catch(() => ({}));
+  return stored[SCHEDULE_STATE_KEY] || {};
+}
 
-  if (!authCheck.isLoggedIn) {
-    await addLog("Daily check skipped: Account not logged in.");
-    return;
-  }
+async function saveScheduleState(next) {
+  const state = { ...(await getScheduleState()), ...next };
+  await chrome.storage.local.set({ [SCHEDULE_STATE_KEY]: state }).catch(() => {});
+  return state;
+}
+
+// Scheduled scans run hourly, at each promotion boundary and on startup. There
+// is no once-per-day gate: a scan with nothing new to claim is cheap and quiet.
+function runScheduledCheck(reason = "periodic") {
+  if (scheduledCheckPromise) return scheduledCheckPromise;
+  scheduledCheckPromise = runScheduledCheckOnce(reason).finally(() => { scheduledCheckPromise = null; });
+  return scheduledCheckPromise;
+}
+
+async function runScheduledCheckOnce(reason) {
+  const settings = await getSettings();
+  const verbose = reason !== "periodic";
   if (!settings.runOnStartup) {
-    await addLog("Daily check skipped: Scheduled checks are disabled.");
+    if (verbose) await addLog("Scheduled check skipped: Scheduled checks are disabled.");
     return;
   }
   if (!settings.autoClaim) {
-    await addLog("Daily check skipped: Auto-claim switch is disabled.");
-    return;
-  }
-  if (settings.lastDailyRun === today) {
-    await addLog("Daily check skipped: Already executed once today.");
+    if (verbose) await addLog("Scheduled check skipped: Auto-claim switch is disabled.");
     return;
   }
 
-  await addLog("Daily startup check triggered.");
+  const authCheck = await checkEpicLoginStatus({ force: true });
+  if (!authCheck.isLoggedIn && authCheck.remembered) {
+    await addLog("Scheduled check: Epic session expired but the account is remembered; claims will reselect it on Epic's sign-in page.");
+  } else if (!authCheck.isLoggedIn) {
+    // Right after browser startup the cookie store and network are often not
+    // ready yet, so a logged-out answer is retried instead of trusted.
+    const schedule = await getScheduleState();
+    const retries = schedule.startupRetries || 0;
+    if (reason !== "periodic" && retries < STARTUP_RETRY_LIMIT) {
+      await saveScheduleState({ startupRetries: retries + 1, pendingCheck: true });
+      chrome.alarms.create(STARTUP_RETRY_ALARM, { delayInMinutes: 1 });
+      if (retries === 0) await addLog(`Scheduled check deferred: Epic login not confirmed yet (${authCheck.status}). Retrying in 1 minute.`);
+    } else {
+      await saveScheduleState({ pendingCheck: true });
+      if (verbose) await addLog("Scheduled check skipped: Account not logged in. It will run once Epic reports a login.");
+    }
+    return;
+  }
+
+  await saveScheduleState({ startupRetries: 0, pendingCheck: false, lastCheckAt: new Date().toISOString(), lastCheckReason: reason });
   try {
-    await runClaimBatch({ force: false });
-    await updateSettingsInternal({ lastDailyRun: today });
+    const summary = await runClaimBatch({ force: reason === "new-drop", automatic: true, quiet: reason === "periodic" });
+    await updateSettingsInternal({ lastDailyRun: localDayKey() });
+    return summary;
   } catch (error) {
-    await addLog(`Daily check failed and will retry later: ${readableError(error)}`);
+    await saveScheduleState({ pendingCheck: true });
+    chrome.alarms.create(STARTUP_RETRY_ALARM, { delayInMinutes: 5 });
+    await addLog(`Scheduled check failed and will retry in 5 minutes: ${readableError(error)}`);
   }
 }
 
 async function runClaimNow() {
   const authCheck = await checkEpicLoginStatus({ force: true });
-  if (authCheck.status === "logged_out") {
+  if (authCheck.status === "logged_out" && !authCheck.remembered) {
     await addLog("Manual Start failed: User not logged in to Epic Games Store.");
     throw new Error("Please log in to Epic Games Store on your browser first.");
   }
@@ -1032,7 +1286,11 @@ async function runClaimNow() {
   return runClaimBatch({ force: true });
 }
 
-async function runClaimBatch({ force = false }) {
+function runClaimBatch(options) {
+  return withQueueLock(() => runClaimBatchLocked(options));
+}
+
+async function runClaimBatchLocked({ force = false, automatic = false, quiet = false }) {
   const existingQueue = await getClaimQueue();
   if (existingQueue?.status === "running") {
     const message = existingQueue.current
@@ -1051,15 +1309,29 @@ async function runClaimBatch({ force = false }) {
   const catalog = await refreshCatalog({ force });
   if (catalog.errors?.epic) throw new Error(`Catalog refresh failed: ${catalog.errors.epic}`);
   const games = [...catalog.epic];
+  // Skip games the account already owns without opening a tab for them.
+  await syncEpicLibrary({ force, quiet: true }).catch(() => null);
   const claimed = await getEpicClaimedGames();
   const completedIds = new Set(claimed.filter(isClaimCompleted).map((game) => game.id));
-  const candidates = games.filter((game) => !completedIds.has(game.id));
+  const unclaimed = games.filter((game) => !completedIds.has(game.id));
+  // Unattended scans back off from a game that just failed instead of
+  // reopening it every hour; Manual Start always retries.
+  const records = new Map(claimed.map((game) => [game.id, game]));
+  const candidates = automatic
+    ? unclaimed.filter((game) => {
+      const record = records.get(game.id);
+      if (!record || !["failed", "needs_attention"].includes(record.status)) return true;
+      return Date.now() - (Date.parse(record.claimedAt || "") || 0) >= AUTO_RETRY_COOLDOWN_MS;
+    })
+    : unclaimed;
 
   if (candidates.length === 0) {
-    const message = games.length
-      ? "All current free games are already claimed."
-      : "No free games available right now.";
-    await addLog(message);
+    const message = games.length === 0
+      ? "No free games available right now."
+      : unclaimed.length === 0
+        ? "All current free games are already claimed."
+        : `${unclaimed.length} unclaimed game(s) failed recently; automatic retry is paused for up to 3 hours. Use Manual Start to retry now.`;
+    if (!quiet) await addLog(message);
     await updateSettingsInternal({ lastRunAt: new Date().toISOString(), lastRunMessage: message });
     return { total: games.length, queued: 0, skipped: games.length, failed: 0, message };
   }
@@ -1211,7 +1483,7 @@ async function recordClaimStatus(platform, id, status, detail = "") {
   const wasCompleted = index >= 0 && isClaimCompleted(claimed[index]);
   if (index >= 0) claimed[index] = { ...claimed[index], ...record };
   else claimed.unshift(record);
-  await chrome.storage.local.set({ [CLAIMED_KEY]: claimed.slice(0, 250) });
+  await chrome.storage.local.set({ [CLAIMED_KEY]: claimed.slice(0, CLAIMED_LIMIT) });
 
   await chrome.storage.local.set({ [CATALOG_KEY]: catalog });
   if (isClaimCompleted(record) && !wasCompleted && !completionNotificationIds.has(id)) {
@@ -1300,6 +1572,92 @@ async function fetchNotificationImageDataUrl(imageUrl) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function fetchOrderHistoryPage(pageToken = "") {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(orderHistoryUrl(pageToken), {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
+    if (response.status === 401 || response.status === 403) throw new Error(`Epic order history requires login (HTTP ${response.status}).`);
+    if (!response.ok) throw new Error(`Epic order history returned HTTP ${response.status}.`);
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      // Epic answers a signed-out request with its HTML login page.
+      throw new Error("Epic order history did not return JSON (signed out or blocked).");
+    }
+    return parseOrderHistory(payload);
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("Epic order history timed out.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Newest orders come first, so the first page is enough to confirm a claim
+// that just happened.
+async function isOwnedOnAccount(task) {
+  try {
+    const { items } = await fetchOrderHistoryPage();
+    const owned = findOwnedItem({ id: task.gameId, title: task.title, offerId: task.offerId }, items);
+    if (owned) await addLog(`Epic order history shows "${safeLogDetail(task.title || task.gameId, 100)}" is owned.`);
+    return Boolean(owned);
+  } catch (error) {
+    await addUniqueClaimLog(`ownership-check:${task.gameId}:${readableError(error)}`, `Could not verify ownership of "${safeLogDetail(task.title || task.gameId, 100)}" via Epic order history: ${readableError(error)}`);
+    return false;
+  }
+}
+
+async function getLibraryState() {
+  const stored = await chrome.storage.local.get(LIBRARY_KEY).catch(() => ({}));
+  return stored[LIBRARY_KEY] || { syncedAt: null, itemCount: 0, error: null };
+}
+
+function syncEpicLibrary(options = {}) {
+  if (librarySyncPromise) return librarySyncPromise;
+  librarySyncPromise = syncEpicLibraryOnce(options).finally(() => { librarySyncPromise = null; });
+  return librarySyncPromise;
+}
+
+// Import the account's order history so "claimed" reflects the Epic account,
+// not just what this browser profile happened to observe.
+async function syncEpicLibraryOnce({ force = false, quiet = false } = {}) {
+  const previous = await getLibraryState();
+  const syncedAt = Date.parse(previous.syncedAt || "");
+  if (!force && !previous.error && Number.isFinite(syncedAt) && Date.now() - syncedAt < LIBRARY_SYNC_TTL_MS) return previous;
+
+  const items = [];
+  try {
+    let token = "";
+    for (let page = 0; page < LIBRARY_MAX_PAGES; page += 1) {
+      const result = await fetchOrderHistoryPage(token);
+      items.push(...result.items);
+      if (!result.nextPageToken || result.nextPageToken === token) break;
+      token = result.nextPageToken;
+    }
+  } catch (error) {
+    const state = { ...previous, error: readableError(error), lastAttemptAt: new Date().toISOString() };
+    await chrome.storage.local.set({ [LIBRARY_KEY]: state });
+    if (!quiet || previous.error !== state.error) await addLog(`Epic library sync failed: ${state.error}`);
+    return state;
+  }
+
+  const catalog = (await chrome.storage.local.get(CATALOG_KEY))[CATALOG_KEY] || emptyCatalog();
+  const merged = mergeOwnedIntoClaimed(await getEpicClaimedGames(), catalog.epic || [], items);
+  await chrome.storage.local.set({ [CLAIMED_KEY]: merged.claimedGames.slice(0, CLAIMED_LIMIT) });
+  const state = { syncedAt: new Date().toISOString(), itemCount: items.length, error: null };
+  await chrome.storage.local.set({ [LIBRARY_KEY]: state });
+  if (!quiet || merged.added || merged.updated || previous.error) {
+    await addLog(`Epic library synced: ${items.length} owned item(s) on the account, ${merged.added} imported, ${merged.updated} marked owned.`);
+  }
+  return state;
 }
 
 async function getEpicClaimedGames() {

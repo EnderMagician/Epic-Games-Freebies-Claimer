@@ -4,6 +4,10 @@
   root.FreebiesClaimMachine = api;
 })(typeof globalThis === 'object' ? globalThis : self, () => {
   const TERMINAL_PHASES = new Set(['completed', 'failed']);
+  // A click can land before Epic's React tree hydrates and do nothing. Retry a
+  // still-visible action after this delay, a bounded number of times.
+  const ACTION_RETRY_MS = 15000;
+  const MAX_ACTION_CLICKS = 3;
 
   function createClaimTask({ gameId, tabId, frameId = 0, now = Date.now(), title = null, url = null, catalogEligible = false }) {
     return {
@@ -53,6 +57,10 @@
       current.terminalReason = null;
     }
 
+    if (observation.context === 'checkout' || observation.checkoutOverlay) current.checkoutSeenAt = now;
+    const sinceAction = now - (current.lastActionAt || 0);
+    const checkoutSinceAction = (current.checkoutSeenAt || 0) > (current.lastActionAt || 0);
+
     const isLegacyObservation = !observation.context && !('checkoutTotalEvidence' in observation) && !('offerEvidence' in observation);
     const offerEvidence = observation.offerEvidence || (isLegacyObservation ? observation.freeEvidence : 'unknown');
     const checkoutEvidence = observation.checkoutTotalEvidence
@@ -64,21 +72,33 @@
     const canConfirm = checkoutFree && current.offerVerified !== false
       && (actions.has('add_to_library') || actions.has('place_order'));
 
-    if ((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') && actions.has('get') && productEligible) {
+    const getClicks = current.getClicks || 0;
+    const retryGet = current.phase === 'awaiting_outcome' && sinceAction >= ACTION_RETRY_MS
+      && !checkoutSinceAction && getClicks < MAX_ACTION_CLICKS;
+    if (((current.phase === 'waiting_for_get' || current.phase === 'needs_attention') || retryGet) && actions.has('get') && productEligible) {
+      const retry = current.phase === 'awaiting_outcome';
       current.phase = 'awaiting_outcome';
       current.terminalReason = null;
       current.offerVerified = true;
       current.attempts += 1;
+      current.getClicks = getClicks + 1;
+      current.lastActionAt = now;
       current.lastProgressAt = now;
-      return { task: current, decision: decision('click_get', 'Visible Get action is available.') };
+      return { task: current, decision: decision('click_get', retry ? `Get had no effect; retrying (${current.getClicks}/${MAX_ACTION_CLICKS}).` : 'Visible Get action is available.') };
     }
 
-    if ((current.phase === 'waiting_for_get' || current.phase === 'awaiting_outcome' || current.phase === 'needs_attention') && canConfirm) {
+    const confirmClicks = current.confirmClicks || 0;
+    const retryConfirm = current.phase === 'confirmation_clicked' && sinceAction >= ACTION_RETRY_MS
+      && confirmClicks < MAX_ACTION_CLICKS;
+    if ((current.phase === 'waiting_for_get' || current.phase === 'awaiting_outcome' || current.phase === 'needs_attention' || retryConfirm) && canConfirm) {
+      const retry = current.phase === 'confirmation_clicked';
       current.phase = 'confirmation_clicked';
       current.terminalReason = null;
       current.attempts += 1;
+      current.confirmClicks = confirmClicks + 1;
+      current.lastActionAt = now;
       current.lastProgressAt = now;
-      return { task: current, decision: decision('click_confirm', 'Verified zero-cost confirmation action is available.') };
+      return { task: current, decision: decision('click_confirm', retry ? `Confirmation had no effect; retrying (${current.confirmClicks}/${MAX_ACTION_CLICKS}).` : 'Verified zero-cost confirmation action is available.') };
     }
 
     const reason = actions.has('get') && !productEligible
@@ -91,5 +111,5 @@
     return { task: current, decision: decision('wait', reason) };
   }
 
-  return { createClaimTask, reduceClaimTask };
+  return { createClaimTask, reduceClaimTask, ACTION_RETRY_MS, MAX_ACTION_CLICKS };
 });

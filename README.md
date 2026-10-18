@@ -16,6 +16,7 @@ It uses the Epic account session already present in the browser. It does not sto
 - Shows a quiet native notification with the game's cover when ownership is newly confirmed; cover loading is capped at two seconds and never pauses the claim queue.
 - Recognizes a manually opened current giveaway page when Auto-claim is enabled.
 - Detects games that go directly from `Get` to owned/library state.
+- Syncs the claimed library with the Epic account's order history, so games already owned (including ones claimed on another computer) are recognised and skipped.
 - Keeps claimed-game history in extension storage.
 - Shows the three newest claimed games in the popup and opens the complete history as card-based library view.
 - Opens Epic Store pages when a current-freebie or claimed-game card is clicked.
@@ -60,13 +61,20 @@ The current giveaway cards show the game, expiration time, and claim state.
 
 ### Claimed Library
 
-The main popup displays the three newest games recorded as claimed or owned. Click the library card to open the complete card-based history. The full view is sorted newest first, with the three preview games highlighted.
+The main popup shows the three newest games. Click the card to open the full Library view, built for accounts with hundreds of games:
+
+- Search by title (press `/` to focus, `Esc` to clear, `Esc` again to close).
+- Sort newest, oldest, or A–Z; the list is grouped by month (or by letter) with sticky headers.
+- Filter chips: **All**, **Claimed here** (claimed by this extension), **From account** (imported from Epic order history).
+- Rows render in pages of 60 as you scroll; games without a cover get a coloured monogram. Clicking a row opens its store page, or a store search for imported games.
+- The sync button refreshes ownership from Epic order history.
 
 ### Automation
 
-- **Auto-claim new freebies** enables automatic claiming during startup/daily checks and manual scans.
-- **Run on browser startup** enables the once-per-day startup check.
-- Disabling **Run on browser startup** also disables scheduled daily checks; Manual Start remains available.
+- **Auto-claim new freebies** enables automatic claiming during scheduled and manual scans.
+- **Scheduled scans** run on browser startup, every hour, and a few minutes after the next promotion starts or ends (taken from Epic's catalog). Disabling it leaves only Manual Start.
+- On startup the Epic login is often not ready yet; the scan retries every minute (up to five times) and also runs as soon as Epic reports a login.
+- An unattended scan waits three hours before retrying a game that just failed; Manual Start always retries immediately.
 - **Store Region** controls the Epic catalog country used for giveaway detection.
 
 ### Activity Log
@@ -91,6 +99,15 @@ For a batch claim, the background worker creates a persistent serial queue:
 
 If you manually open a URL matching a current unclaimed giveaway, the content script can adopt that tab when Auto-claim is enabled. A manually opened page is not adopted while a different serial queue item is active.
 
+### Reliability safeguards in v3.2.0
+
+- Ownership is confirmed through Epic's order history when the page does not show it, after each order click, before a claim times out, and when a claim tab is closed.
+- If the order click leaves no ownership signal for 25 seconds, the product page is reloaded once so the observer can see "In Library" (or retry Get).
+- A Get or confirmation click that has no visible effect is retried after 15 seconds, at most three times; Get is never re-clicked while Epic's checkout modal is open.
+- All queue updates (tab events, the watchdog, popup polling) run under one lock.
+- Epic's web session (`EPIC_SSO`) lasts about 8 hours, while the remembered account (`EPIC_SSO_RM`) lasts months. After the session lapses, Get detours through `www.epicgames.com/id/login/switch-account` ("Welcome back"). The observer selects the account when it is the only one listed and no password or code field is shown (at most twice per claim). Several accounts, a password, or MFA pause the claim with the reason in the activity log.
+- A claim blocked by CAPTCHA/terms is abandoned after 15 minutes so the rest of the queue continues.
+
 ### Reliability safeguards in v3.1.0
 
 - Queue and active-task writes are serialized so simultaneous browser events cannot overwrite each other's state.
@@ -107,6 +124,10 @@ Open Epic Store in the same browser profile and refresh the popup. The extension
 ### A claim is paused
 
 Open the active Epic tab and look for CAPTCHA, Cloudflare, age/terms confirmation, or a price other than zero. Complete the required manual step, then refresh the page. The observer can resume a paused task when a valid Get or confirmation action becomes available.
+
+### Popup says "Session expired"
+
+Epic's 8-hour web session ended but the account is still remembered. Claims continue: the extension picks your account on Epic's "Welcome back" page. If the log says it paused for a password or several accounts, sign in once in the claim tab.
 
 ### A stale task remains running
 
@@ -136,7 +157,7 @@ The extension communicates only with Epic Games Store endpoints and the Epic sta
 manifest.json             Extension manifest and permissions
 scripts/background.js     Service worker, storage, catalog, queue, and messages
 scripts/content-epic.js   Epic page observer and safe action clicking
-scripts/core/             Pure state, auth, observation, routing, and queue modules
+scripts/core/             Pure state, auth, observation, routing, queue, and library-sync modules
 popup/popup.html           Popup structure and templates
 popup/popup.js             Popup state, cards, modal, and activity log rendering
 popup/popup.css            Popup styling
@@ -157,6 +178,6 @@ The automated tests cover migration, authentication fallback, safe page observat
 
 ## Intentional limitations
 
-- Claim history is the extension’s recorded history; it is not a complete import of the Epic account library.
+- Library sync reads Epic's internal order-history endpoint (`www.epicgames.com/account/v2/payment/ajaxGetOrderHistory`). It is undocumented and may change; when it fails, the popup status shows "Library sync: …" and claiming continues using page detection only. Paid purchases appear in the library view too.
 - Epic can change its page structure, labels, checkout flow, or catalog API. The observer is deliberately conservative and pauses when it cannot prove a safe zero-cost action.
 - CAPTCHA, Cloudflare challenges, age gates, terms requiring explicit user action, payment prompts, and non-zero prices require manual handling.

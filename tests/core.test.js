@@ -377,3 +377,94 @@ test('skipping and cancellation terminate pending work without opening tabs', ()
   assert.equal(cancelled.pending.length, 0);
   assert.equal(cancelled.status, 'cancelled');
 });
+
+test('retries a Get click that had no effect, but not behind an open checkout', () => {
+  const { ACTION_RETRY_MS, MAX_ACTION_CLICKS } = require('../scripts/core/claim-machine.js');
+  const observation = { context: 'product', visibleActions: ['get'], offerEvidence: 'confirmed', checkoutTotalEvidence: 'unknown', blockers: [] };
+  const first = reduceClaimTask(createClaimTask({ gameId: 'epic-retry', tabId: 1, now: 0 }), observation, 1000);
+  assert.equal(first.decision.action, 'click_get');
+
+  const tooSoon = reduceClaimTask(first.task, observation, 1000 + ACTION_RETRY_MS - 1);
+  assert.equal(tooSoon.decision.action, 'wait');
+
+  const behindModal = reduceClaimTask(first.task, { ...observation, checkoutOverlay: true }, 1000 + ACTION_RETRY_MS);
+  assert.equal(behindModal.decision.action, 'wait');
+
+  let task = first.task;
+  let now = 1000;
+  for (let click = 2; click <= MAX_ACTION_CLICKS; click += 1) {
+    now += ACTION_RETRY_MS;
+    const retried = reduceClaimTask(task, observation, now);
+    assert.equal(retried.decision.action, 'click_get');
+    assert.match(retried.decision.reason, /retrying/);
+    task = retried.task;
+  }
+  const exhausted = reduceClaimTask(task, observation, now + ACTION_RETRY_MS);
+  assert.equal(exhausted.decision.action, 'wait');
+});
+
+test('retries a free confirmation click that left the button in place', () => {
+  const { ACTION_RETRY_MS } = require('../scripts/core/claim-machine.js');
+  const checkout = { context: 'checkout', visibleActions: ['add_to_library'], offerEvidence: 'unknown', checkoutTotalEvidence: 'confirmed', blockers: [] };
+  const start = { ...createClaimTask({ gameId: 'epic-confirm-retry', tabId: 1, now: 0 }), phase: 'awaiting_outcome' };
+  const first = reduceClaimTask(start, checkout, 100);
+  assert.equal(first.decision.action, 'click_confirm');
+  assert.equal(reduceClaimTask(first.task, checkout, 200).decision.action, 'wait');
+  assert.equal(reduceClaimTask(first.task, checkout, 100 + ACTION_RETRY_MS).decision.action, 'click_confirm');
+});
+
+test('recognizes current Epic ownership and order-success wording', () => {
+  const { isOwnershipText } = require('../scripts/core/epic-observation.js');
+  for (const text of ['In Library', 'Owned', 'Thanks for your order!', 'Order complete', 'Đã sở hữu', 'Added to your library']) {
+    assert.equal(isOwnershipText(text), true, text);
+  }
+  for (const text of ['Get', 'Add it to your library to get started', 'Library', '']) {
+    assert.equal(isOwnershipText(text), false, text);
+  }
+});
+
+test('parses Epic order history and merges ownership into claim history', () => {
+  const { parseOrderHistory, mergeOwnedIntoClaimed } = require('../scripts/core/epic-library.js');
+  const parsed = parseOrderHistory({
+    orders: [
+      { createdAtMillis: 1_700_000_000_000, items: [{ offerId: 'a1', namespace: 'n1', description: 'Alpha' }] },
+      { orderStatus: 'REFUNDED', items: [{ offerId: 'r1', description: 'Refunded' }] },
+      { items: [{ offerId: 'b2', description: 'Beta: Deluxe' }] }
+    ],
+    nextPageToken: 'next'
+  });
+  assert.deepEqual(parsed.items.map((item) => item.offerId), ['a1', 'b2']);
+  assert.equal(parsed.nextPageToken, 'next');
+  assert.throws(() => parseOrderHistory({}), /unexpected/);
+
+  const catalog = [
+    { id: 'epic-a1', title: 'Alpha', image: 'a.jpg', url: 'https://store.epicgames.com/p/alpha' },
+    { id: 'epic-zz', title: 'Beta - Deluxe' },
+    { id: 'epic-cc', title: 'Gamma' }
+  ];
+  const claimed = [{ id: 'epic-cc', title: 'Gamma', status: 'failed' }];
+  const merged = mergeOwnedIntoClaimed(claimed, catalog, parsed.items, '2026-01-01T00:00:00.000Z');
+  const byId = new Map(merged.claimedGames.map((game) => [game.id, game]));
+  assert.equal(byId.get('epic-a1').status, 'owned');
+  assert.equal(byId.get('epic-a1').image, 'a.jpg');
+  assert.equal(byId.get('epic-zz').status, 'owned', 'matches by normalized title when offer ids differ');
+  assert.equal(byId.get('epic-cc').status, 'failed', 'unowned history is untouched');
+  assert.equal(merged.claimedGames.filter((game) => game.title.startsWith('Beta')).length, 1, 'no duplicate import');
+  assert.equal(claimed[0].status, 'failed', 'input is not mutated');
+});
+
+test('classifies Epic\'s "Welcome back" account picker conservatively', () => {
+  const { classifyAccountPicker } = require('../scripts/core/epic-observation.js');
+  const url = 'https://www.epicgames.com/id/login/switch-account?lang=en-US&redirect_uri=https%3A%2F%2Fstore.epicgames.com%2Fp%2Fx';
+  const common = ['Privacy Policy', 'Terms of Service', 'Sign in with another account', 'Help', ''];
+
+  const single = classifyAccountPicker({ url, bodyText: 'Welcome back', candidates: [...common, 'GamerOne g***@example.com'] });
+  assert.equal(single.state, 'single');
+  assert.equal(single.index, common.length);
+
+  assert.equal(classifyAccountPicker({ url, bodyText: 'Welcome back', candidates: [...common, 'GamerOne', 'GamerTwo'] }).state, 'ambiguous');
+  assert.equal(classifyAccountPicker({ url, bodyText: 'Welcome back', candidates: common }).state, 'no_account');
+  assert.equal(classifyAccountPicker({ url, bodyText: 'Welcome back', hasPasswordField: true, candidates: [...common, 'GamerOne'] }).state, 'password');
+  assert.equal(classifyAccountPicker({ url: 'https://www.epicgames.com/id/login?lang=en-US', bodyText: 'Sign in', hasPasswordField: true }).state, 'password');
+  assert.equal(classifyAccountPicker({ url: 'https://store.epicgames.com/en-US/p/x', bodyText: 'Welcome back', candidates: ['GamerOne'] }).state, 'none');
+});

@@ -15,7 +15,7 @@
           <div class="m3-brand-info">
             <div class="m3-title-row">
               <h1 class="m3-app-title">Epic Freebies Claimer</h1>
-              <span class="m3-v2-badge">v3.1.0</span>
+              <span class="m3-v2-badge">v3.2.0</span>
             </div>
             <p class="app-subtitle">Auto-detect & claim free Epic Games</p>
           </div>
@@ -86,6 +86,10 @@
             <span id="claimed-count-badge" class="m3-count-badge">—</span>
           </div>
           <div id="claimed-list" class="claimed-list"></div>
+          <div class="lib-preview-footer">
+            <span id="claimed-preview-more">Open library</span>
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="9 6 15 12 9 18"/></svg>
+          </div>
         </section>
 
         <!-- Automation Settings -->
@@ -109,8 +113,8 @@
             </div>
             <div class="m3-setting-item">
               <div class="setting-info">
-                <span class="setting-label">Run on browser startup</span>
-                <span class="setting-desc">Check once per day on first browser launch</span>
+                <span class="setting-label">Scheduled scans</span>
+                <span class="setting-desc">On startup, hourly, and when a new freebie drops</span>
               </div>
               <label class="m3-switch">
                 <input id="run-on-startup" type="checkbox" />
@@ -141,15 +145,41 @@
         </div>
       </div>
 
-      <section id="claimed-library-modal" class="m3-library-modal hidden" role="dialog" aria-modal="true" aria-labelledby="claimed-library-modal-title">
-        <div class="m3-library-modal-header">
-          <div>
-            <h2 id="claimed-library-modal-title">All Claimed Games</h2>
+      <section id="claimed-library-modal" class="lib hidden" role="dialog" aria-modal="true" aria-labelledby="claimed-library-modal-title">
+        <header class="lib-header">
+          <button id="close-claimed-library" class="lib-icon-btn" type="button" aria-label="Back to overview" title="Back">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 6 9 12 15 18"/></svg>
+          </button>
+          <div class="lib-heading">
+            <h2 id="claimed-library-modal-title">Library</h2>
             <p id="claimed-library-modal-count"></p>
           </div>
-          <button id="close-claimed-library" class="m3-library-close-btn" type="button" aria-label="Close claimed library">×</button>
+          <button id="lib-sync" class="lib-icon-btn" type="button" aria-label="Sync with Epic order history" title="Sync with Epic order history">
+            <svg class="refresh-svg" viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.2" fill="none"><path d="M21.5 2v6h-6M2.1 12a10 10 0 0 1 17-6.9L21.5 8M2.5 22v-6h6M21.9 12a10 10 0 0 1-17 6.9L2.5 16"/></svg>
+          </button>
+        </header>
+
+        <div id="lib-stats" class="lib-stats"></div>
+
+        <div class="lib-toolbar">
+          <label class="lib-search">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+            <input id="lib-search" type="search" placeholder="Search games" autocomplete="off" spellcheck="false" aria-label="Search library" />
+          </label>
+          <select id="lib-sort" class="lib-sort" aria-label="Sort library">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="title">A–Z</option>
+          </select>
         </div>
-        <div id="claimed-library-all-list" class="claimed-library-all-list"></div>
+
+        <div id="lib-chips" class="lib-chips" role="tablist" aria-label="Filter library">
+          <button type="button" role="tab" class="lib-chip" data-filter="all">All <span></span></button>
+          <button type="button" role="tab" class="lib-chip" data-filter="extension">Claimed here <span></span></button>
+          <button type="button" role="tab" class="lib-chip" data-filter="account">From account <span></span></button>
+        </div>
+
+        <div id="claimed-library-all-list" class="lib-list" tabindex="-1"></div>
       </section>
 
       <!-- Activity Log Sliding Drawer Sheet (With Physical Door Handle Tab attached to top border) -->
@@ -191,15 +221,13 @@
     </template>
 
     <template id="claimed-template">
-      <article class="m3-claimed-card">
-        <div class="m3-cover-wrapper">
-          <img class="claimed-cover" alt="" />
+      <article class="lib-row">
+        <div class="lib-thumb"><span class="lib-monogram"></span></div>
+        <div class="lib-row-info">
+          <strong class="lib-row-title"></strong>
+          <span class="lib-row-meta"></span>
         </div>
-        <div class="m3-claimed-info">
-          <strong class="claimed-title"></strong>
-          <span class="claimed-date"></span>
-        </div>
-        <span class="m3-badge-claimed">Claimed</span>
+        <span class="lib-source"></span>
       </article>
     </template>
     <script src="popup.js"></script>
