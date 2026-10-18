@@ -2,4 +2,3 @@ test-results/
 .brave-e2e-profile/
 node_modules/
 .pnpm-store/
-docs/
